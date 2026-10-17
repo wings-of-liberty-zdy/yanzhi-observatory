@@ -1,0 +1,14 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "yanzhi-observatory-heartbeat",
+  "main": "observatory-heartbeat.mjs",
+  "compatibility_date": "2026-09-11",
+  "triggers": {
+    // 独立于 GitHub 的定时器：即使 GitHub 的 schedule 迟迟不投递，这里也会按点唤醒观测站工作流。
+    // 工作流本身幂等：该采集才采集，该发布才发布，都做完了就空转。
+    // UTC 23:17/04:17/10:17/12:17/13:47/14:17/14:47/22:17 = 北京时间 07:17/12:17/18:17/20:17/21:47/22:17/22:47/次日 06:17。
+    // 采集窗全部避开 OpenCode Go 的峰时（北京时间周一至周五 09:00–12:00、14:00–18:00）。
+    "crons": ["17 4,10,12,22,23 * * *", "17,47 13,14 * * *"]
+  },
+  "observability": { "enabled": true }
+}

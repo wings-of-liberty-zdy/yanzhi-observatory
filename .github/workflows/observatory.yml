@@ -1,0 +1,390 @@
+name: Observatory Daily Pipeline
+
+# 2026-10-17 拆站：代码在本仓库，配置 / 运行时数据 / 公开日报在言志仓库。
+# 本 workflow 把言志仓库检出到 yanzhi/，用 OBSERVATORY_ROOT 指向它，跑完再把 content/daily 推回去。
+# 推送后 Cloudflare Workers Builds 会检测到言志 main 更新并自动重建静态站，与拆分前是同一条链路。
+
+on:
+  # 心跳式调度：GitHub 的 schedule 会延迟甚至整次丢弃，所以不再依赖某个精确时刻。
+  # 每 35 分钟唤醒一次，醒来自查远程状态：该采集就采集，该发布就发布，都做完了立即空转。
+  # 空转跳过检出、依赖安装与模型调用，约十秒结束；漏掉的心跳会被后面的心跳自动补上。
+  schedule:
+    - cron: "7,42 1,3,5,7,9,11,13,15,17,19,21,23 * * *"
+    - cron: "17 0,2,4,6,8,10,12,14,16,18,20,22 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run one stage or the complete pipeline"
+        type: choice
+        required: true
+        default: all
+        options: [collect, publish, all, next-action]
+
+concurrency:
+  group: observatory-daily
+  cancel-in-progress: false
+
+env:
+  # 数据真源所在的仓库根。本仓库不持有 config/、data/、content/daily/。
+  OBSERVATORY_ROOT: ${{ github.workspace }}/yanzhi
+  # 注意：不能写 ${{ github.repository }}——那在本仓库里指向观测站自己。
+  YANZHI_REPOSITORY: wings-of-liberty-zdy/yanzhi-blog
+
+jobs:
+  observatory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # 本仓库只读；写言志走 YANZHI_PUSH_TOKEN。
+      contents: read
+    outputs:
+      candidate_sync: ${{ steps.candidate_sync.outcome }}
+      publish: ${{ steps.publish.outcome }}
+      persist: ${{ steps.persist.outcome }}
+      search_health: ${{ steps.search_health.outcome }}
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OBSERVATORY_CUSTOM_API_KEY: ${{ secrets.OBSERVATORY_CUSTOM_API_KEY }}
+      DEEPSEEK_SEARCH_API_KEY: ${{ secrets.DEEPSEEK_SEARCH_API_KEY }}
+      BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
+      OBSERVATORY_ALLOW_CUSTOM_EGRESS: ${{ vars.OBSERVATORY_ALLOW_CUSTOM_EGRESS }}
+      # 采集阶段会读 GitHub（工具发现、阮一峰周刊）。匿名调用只有 60 次/小时且按出口 IP 计，
+      # Runner 的共享 IP 很容易撞 403；用工作流自带 token 提到 5000 次/小时。
+      # 这些调用读的是公开数据，用本仓库 token 即可。
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve heartbeat action
+        id: stage
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_MODE: ${{ inputs.mode }}
+          CANDIDATE_BRANCH: observatory-candidates
+          # 读的是言志仓库的发布状态与候选分支，所以必须用能读言志的令牌。
+          GH_TOKEN: ${{ secrets.YANZHI_PUSH_TOKEN }}
+          REPOSITORY: ${{ env.YANZHI_REPOSITORY }}
+        run: |
+          # 采集窗起始（北京时间的分钟数）。四个窗口必须落在 OpenCode Go 的非峰时段——
+          # 峰值是北京时间周一至周五 09:00–12:00 与 14:00–18:00（UTC 01:00–04:00、06:00–10:00），
+          # 峰时单价翻倍（$0.30/$1.20 vs $0.15/$0.60）。
+          # 容差 120 分钟，所以每个窗口连同它的补跑区间都在非峰：07:00–09:00、12:00–14:00、
+          # 18:00–20:00、20:00–22:00。原先的 16:00 窗口整个落在峰里，240 分钟容差还会把
+          # 08:00 和 12:00 两个窗口的补跑拖进峰段。
+          collection_start_minutes=(420 720 1080 1200)
+          mode="idle"
+          auto="false"
+          date="$(TZ=Asia/Shanghai date +%F)"
+          window=""
+          now_minutes=$((10#$(TZ=Asia/Shanghai date +%H) * 60 + 10#$(TZ=Asia/Shanghai date +%M)))
+          local_time="$(TZ=Asia/Shanghai date +%H%M)"
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            case "$DISPATCH_MODE" in
+              collect|publish|all) mode="$DISPATCH_MODE" ;;
+              next-action) mode="idle"; auto="true" ;;
+              *) echo "Unknown dispatch mode: $DISPATCH_MODE" >&2; exit 1 ;;
+            esac
+          else
+            auto="true"
+          fi
+
+          if [[ "$auto" == "true" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "Resolving heartbeat action (event=$EVENT_NAME manual_mode=$mode)"
+            if [[ "$auto" == "true" ]]; then
+            # 北京时间 21:30 起优先补发：缺窗口标记时不能整晚只采集、不发布。
+            if [[ "$local_time" -ge 2130 ]]; then
+              publish_ceiling="$date"
+            else
+              publish_ceiling="$(TZ=Asia/Shanghai date -d 'yesterday' +%F)"
+            fi
+            latest_date="$(gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$REPOSITORY/contents/content/daily/_status.json?ref=main" --jq .date)"
+            if [[ ! "$latest_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+              || [[ "$(date -u -d "$latest_date" +%F 2>/dev/null)" != "$latest_date" ]]; then
+              echo "Remote publication status has an invalid date: $latest_date" >&2
+              exit 1
+            fi
+            if [[ "$latest_date" < "$publish_ceiling" ]]; then
+              date="$(date -u -d "$latest_date +1 day" +%F)"
+              mode="publish"
+            else
+              date="$publish_ceiling"
+            fi
+
+            # 已发布或尚未到点时，再补尚未完成的当日采集窗口。
+            if [[ "$mode" != "publish" ]]; then
+            latest_sync_date="$(gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$REPOSITORY/contents/latest.json?ref=${CANDIDATE_BRANCH}" --jq .date 2>/dev/null || true)"
+            echo "Candidate snapshot date in remote: ${latest_sync_date:-none} (local date $date)"
+            if [[ "$latest_sync_date" == "$date" ]]; then
+              window_state="$(gh api -H 'Accept: application/vnd.github.raw+json' \
+                "repos/$REPOSITORY/contents/window-state.json?ref=${CANDIDATE_BRANCH}" 2>/dev/null || echo '{}')"
+              # 只依赖 grep/tr；无匹配时 grep 退出 1，必须吞掉，否则 pipefail 会把空转心跳判失败。
+              done_windows="$(printf '%s' "$window_state" | grep -o '\[[0-9, ]*\]' | head -n 1 | tr -cd '0-9,' | tr ',' ' ' || true)"
+            else
+              done_windows=""
+            fi
+            for index in "${!collection_start_minutes[@]}"; do
+              start="${collection_start_minutes[$index]}"
+              if [[ "$auto" == "true" ]] && (( now_minutes >= start && (now_minutes - start) < 120 )); then
+                if [[ " ${done_windows} " != *" ${index} "* ]]; then
+                  mode="collect"
+                  window="$index"
+                fi
+              fi
+            done
+            fi
+            fi
+          else
+            echo "Unsupported event: $EVENT_NAME (mode=$mode auto=$auto)" >&2
+            exit 1
+          fi
+          if [[ "$mode" == "collect" ]]; then
+            date="$(TZ=Asia/Shanghai date +%F)"
+          fi
+
+          {
+            echo "mode=$mode"
+            echo "date=$date"
+            echo "window=$window"
+          } >> "$GITHUB_OUTPUT"
+          echo "Heartbeat resolved: mode=$mode date=$date window=${window:-none} (Asia/Shanghai $local_time)"
+
+      - name: Checkout observatory pipeline
+        if: steps.stage.outputs.mode != 'idle'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout yanzhi (data source of truth)
+        if: steps.stage.outputs.mode != 'idle'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.YANZHI_REPOSITORY }}
+          # 用同一个人令牌检出，push 时 yanzhi/.git 里已经带好凭据，不需要再配一次。
+          token: ${{ secrets.YANZHI_PUSH_TOKEN }}
+          path: yanzhi
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        if: steps.stage.outputs.mode != 'idle'
+        with:
+          node-version: 22
+          cache: npm
+
+      - if: steps.stage.outputs.mode != 'idle'
+        run: npm ci
+
+      # 候选池按当天日期累积，且与发布预览分开缓存，避免晚间心跳抢先占用键名。
+      - name: Restore candidate pool
+        if: steps.stage.outputs.mode != 'idle'
+        uses: actions/cache@v4
+        with:
+          path: yanzhi/data/observatory/candidates
+          key: observatory-pool-${{ steps.stage.outputs.date }}-${{ github.run_id }}
+          restore-keys: |
+            observatory-pool-${{ steps.stage.outputs.date }}-
+
+      - name: Restore previews and usage
+        if: steps.stage.outputs.mode != 'idle'
+        uses: actions/cache@v4
+        with:
+          path: |
+            yanzhi/data/observatory/previews
+            yanzhi/data/observatory/usage
+          key: observatory-publish-${{ steps.stage.outputs.date }}-${{ github.run_id }}
+          restore-keys: |
+            observatory-publish-${{ steps.stage.outputs.date }}-
+
+      - name: Collect source signals
+        if: steps.stage.outputs.mode == 'collect' || steps.stage.outputs.mode == 'midday' || steps.stage.outputs.mode == 'final' || steps.stage.outputs.mode == 'publish' || steps.stage.outputs.mode == 'all'
+        env:
+          OBS_DATE: ${{ steps.stage.outputs.date }}
+        run: npm run observatory:collect -- --date="$OBS_DATE"
+
+      - name: Sync private candidate snapshot
+        id: candidate_sync
+        if: steps.stage.outputs.mode != 'idle'
+        continue-on-error: true
+        env:
+          # 候选快照写进言志仓库的私有分支，所以用能写言志的令牌，并显式给出目标仓库
+          # （GitHub Actions 注入的 GITHUB_REPOSITORY 指向本仓库，不能用）。
+          GITHUB_TOKEN: ${{ secrets.YANZHI_PUSH_TOKEN }}
+          OBSERVATORY_GITHUB_REPOSITORY: ${{ env.YANZHI_REPOSITORY }}
+          OBS_DATE: ${{ steps.stage.outputs.date }}
+          OBS_WINDOW: ${{ steps.stage.outputs.window }}
+          OBSERVATORY_CANDIDATE_BRANCH: observatory-candidates
+        run: node scripts/observatory/sync-candidates.mjs --date="$OBS_DATE" ${OBS_WINDOW:+--window="$OBS_WINDOW"}
+
+      - name: Generate midday preview
+        if: steps.stage.outputs.mode == 'midday'
+        env:
+          OBS_DATE: ${{ steps.stage.outputs.date }}
+        run: npm run observatory:generate -- --stage=midday --date="$OBS_DATE"
+
+      - name: Check reusable final preview
+        id: final_preview
+        if: github.event_name == 'schedule' && steps.stage.outputs.mode == 'publish'
+        env:
+          OBS_DATE: ${{ steps.stage.outputs.date }}
+        shell: bash
+        run: |
+          if node --input-type=module <<'NODE'
+          import path from "node:path";
+          import { hasConsumedEvergreenConflict, readEvergreenHistory } from "./scripts/observatory/ranking.mjs";
+          import { validateIssueDocument } from "./scripts/observatory/validate.mjs";
+          import { observatoryPaths, readConfig, readJson } from "./scripts/observatory/runtime.mjs";
+          const config = await readConfig();
+          const date = process.env.OBS_DATE;
+          const previewPath = path.join(observatoryPaths.previews, `${date}.json`);
+          const preview = await readJson(previewPath, null);
+          if (!preview || preview.stage !== "final") process.exit(1);
+          const evergreenHistory = await readEvergreenHistory(observatoryPaths.publicIssues);
+          if (hasConsumedEvergreenConflict(preview.items, evergreenHistory)) process.exit(1);
+          const requiredTypes = date >= String(config.dailyFormats?.activeFrom ?? "9999-12-31")
+            ? (config.dailyFormats?.requiredTypes ?? [])
+            : [];
+          validateIssueDocument(preview, {
+            source: previewPath,
+            storage: "preview",
+            minimumItems: config.generation.minimumItems,
+            requiredTypes,
+            enforceCurrentPolicy: date >= String(config.editorialRules?.sourceDiversityActiveFrom ?? "9999-12-31"),
+            editorialRules: config.editorialRules,
+            healthPolicy: config.healthPolicy,
+          });
+          NODE
+          then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing the validated final preview for $OBS_DATE."
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate final preview
+        id: generate_final
+        if: (steps.stage.outputs.mode == 'publish' || steps.stage.outputs.mode == 'all') && steps.final_preview.outputs.ready != 'true'
+        env:
+          OBS_DATE: ${{ steps.stage.outputs.date }}
+        run: npm run observatory:generate -- --stage=final --date="$OBS_DATE"
+
+      - name: Save previews for automatic retry
+        if: always() && (steps.stage.outputs.mode == 'publish' || steps.stage.outputs.mode == 'all') && (steps.generate_final.outcome == 'success' || steps.final_preview.outputs.ready == 'true')
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            yanzhi/data/observatory/previews
+            yanzhi/data/observatory/usage
+          key: observatory-publish-${{ steps.stage.outputs.date }}-${{ github.run_id }}
+
+      - name: Publish current preview
+        id: publish
+        if: steps.stage.outputs.mode == 'publish' || steps.stage.outputs.mode == 'all'
+        continue-on-error: true
+        env:
+          OBS_DATE: ${{ steps.stage.outputs.date }}
+        run: npm run observatory:publish -- --require-final --date="$OBS_DATE"
+
+      - name: Verify observatory data
+        id: verify
+        if: always() && steps.stage.outcome == 'success' && steps.stage.outputs.mode != 'idle'
+        run: npm run observatory:verify
+
+      # 拆分前这里跑的是言志全站的 test/typecheck/build；现在站点由 Cloudflare 在数据推回后自行重建，
+      # 所以这里只跑观测站自己的单测（秒级，且需要 yanzhi/ 里的 lib/timeliness.ts 在场）。
+      - name: Unit tests
+        if: (steps.stage.outputs.mode == 'publish' || steps.stage.outputs.mode == 'all') && steps.publish.outcome == 'success'
+        run: npm test
+
+      - name: Save generated state after validation
+        id: persist
+        if: success() && steps.verify.outcome == 'success' && (steps.publish.outcome == 'success' || steps.publish.outcome == 'skipped')
+        env:
+          MODE: ${{ steps.stage.outputs.mode }}
+          OBS_DATE: ${{ steps.stage.outputs.date }}
+        shell: bash
+        run: |
+          git -C yanzhi config user.name "yanzhi-observatory[bot]"
+          git -C yanzhi config user.email "yanzhi-observatory[bot]@users.noreply.github.com"
+          git -C yanzhi add content/daily
+          git -C yanzhi add -f data/observatory/private/preferences.json data/observatory/usage/*.json 2>/dev/null || true
+          if git -C yanzhi diff --cached --quiet; then
+            echo "No public observatory changes to commit."
+            exit 0
+          fi
+          git -C yanzhi commit -m "chore(observatory): $MODE $OBS_DATE"
+          git -C yanzhi push
+
+      - name: Report delayed publication as failure
+        if: always() && steps.publish.outcome == 'failure'
+        run: exit 1
+
+      - name: Report candidate sync as failure
+        if: always() && steps.candidate_sync.outcome == 'failure' && steps.persist.outcome == 'success'
+        run: exit 1
+
+      # 搜索健康度放在最后一步：这里失败不会挡住出刊（采集、生成、发布、提交都已跑完），
+      # 只把「额度到顶」这类静默降级交给下面的失败上报，开一张按天去重的告警 issue。
+      - name: Report search channel health
+        id: search_health
+        if: always() && steps.stage.outcome == 'success' && steps.stage.outputs.mode != 'idle'
+        env:
+          OBS_DATE: ${{ steps.stage.outputs.date }}
+        run: node scripts/observatory/search-health.mjs --date="$OBS_DATE"
+
+  notify-failure:
+    needs: observatory
+    if: always() && needs.observatory.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CANDIDATE_SYNC_OUTCOME: ${{ needs.observatory.outputs.candidate_sync }}
+          PUBLISH_OUTCOME: ${{ needs.observatory.outputs.publish }}
+          PERSIST_OUTCOME: ${{ needs.observatory.outputs.persist }}
+          SEARCH_HEALTH_OUTCOME: ${{ needs.observatory.outputs.search_health }}
+        shell: bash
+        run: |
+          title="[观测站] 自动任务失败"
+          if [[ "$SEARCH_HEALTH_OUTCOME" == "failure" ]]; then
+            # 搜索额度告警走单独一张 issue，并按天去重：额度到顶时每次心跳都会失败，
+            # 不去重就是每 35 分钟一条评论。
+            quota_title="[观测站] 搜索额度告警"
+            quota_body="Brave 搜索本期的请求被按额度拒绝（月度用量上限或免费信用已用尽），本期搜索来源整体降级；采集、生成与发布不受影响。运行：$RUN_URL。请检查 Brave 控制台的月度用量与上限，处理后可关闭本 issue。"
+            quota_issue="$(gh issue list --state open --search "$quota_title in:title" --json number --jq '.[0].number // empty')"
+            if [[ -n "$quota_issue" ]]; then
+              updated="$(gh issue view "$quota_issue" --json updatedAt --jq .updatedAt)"
+              if [[ "$updated" == "$(date -u +%F)"* ]]; then
+                echo "Search quota alert already recorded today; skipping."
+                exit 0
+              fi
+              gh issue comment "$quota_issue" --body "$quota_body"
+            else
+              gh issue create --title "$quota_title" --body "$quota_body"
+            fi
+            exit 0
+          fi
+          if [[ "$PUBLISH_OUTCOME" == "failure" ]]; then
+            reason="日报发布步骤失败。"
+          elif [[ "$PERSIST_OUTCOME" == "failure" ]]; then
+            reason="生成状态提交或推送失败。"
+          elif [[ "$CANDIDATE_SYNC_OUTCOME" == "failure" ]]; then
+            reason="候选池同步失败；其余已完成步骤不会回滚。"
+          else
+            reason="采集、生成、校验或构建步骤失败。"
+          fi
+          body="$reason 运行：$RUN_URL。步骤结果：publish=$PUBLISH_OUTCOME，persist=$PERSIST_OUTCOME，candidate-sync=$CANDIDATE_SYNC_OUTCOME，search-health=$SEARCH_HEALTH_OUTCOME。"
+          issue="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$issue" ]]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+*.log
+
+# 本机配置（OBSERVATORY_ROOT 与临时覆盖）不进仓库
+.env*
+!.env.example
+
+# 本地/CI 借用的言志仓库检出（数据真源，永远不提交进本仓库）
+/yanzhi/
