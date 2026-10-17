@@ -67,10 +67,16 @@ GitHub 的 secrets 不能跨仓库读，所以下列密钥要在**本仓库**的
 | Secret | 用途 |
 |---|---|
 | `YANZHI_PUSH_TOKEN` | 对言志仓库有 `contents: write`；用于 checkout 言志、推送 `content/daily/`、写候选快照分支、读发布状态 |
-| `DEEPSEEK_API_KEY` | 生成模型（当前 activeLlm） |
-| `DEEPSEEK_SEARCH_API_KEY` | 搜索通道（当前 activeSearch，2026-10-17 起） |
-| `BRAVE_SEARCH_API_KEY` | 搜索通道（备用） |
-| `OPENAI_API_KEY` / `GEMINI_API_KEY` / `OBSERVATORY_CUSTOM_API_KEY` | 可选，切提供商时才需要 |
+| `OBSERVATORY_CUSTOM_API_KEY` | 生成模型 —— 当前 `activeLlm` 是 `custom`（OpenCode Go，`deepseek-v4.1-flash`） |
+| `BRAVE_SEARCH_API_KEY` | 搜索通道 —— 当前 `activeSearch` 是 `brave` |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_SEARCH_API_KEY` | 备用通道，切换 `activeLlm` / `activeSearch` 时才需要 |
+| `OPENAI_API_KEY` / `GEMINI_API_KEY` | 可选，切到对应提供商时才需要 |
+
+另有 Repository **variable** `OBSERVATORY_ALLOW_CUSTOM_EGRESS=true`：`custom` 提供商的出口不是官方域名，
+少了它 `providers.mjs` 会拒绝非 loopback 的 custom 出口。
+
+> 当前谁在干活以 `<OBSERVATORY_ROOT>/config/observatory.providers.json` 的 `activeLlm` / `activeSearch` 为准，
+> 本表是 2026-10-17 的快照 —— 改了那两份配置记得回来同步这张表。
 
 失败告警 issue 会开在**本仓库**（`notify-failure` job），搜索额度告警同理。
 

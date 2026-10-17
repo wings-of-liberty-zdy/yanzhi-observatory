@@ -121,8 +121,10 @@ jobs:
             if [[ "$latest_sync_date" == "$date" ]]; then
               window_state="$(gh api -H 'Accept: application/vnd.github.raw+json' \
                 "repos/$REPOSITORY/contents/window-state.json?ref=${CANDIDATE_BRANCH}" 2>/dev/null || echo '{}')"
+              # 先压平换行再 grep：sync-candidates.mjs 用 JSON.stringify(..., null, 2) 写的是缩进格式，
+              # "windows": [ 与它的 ] 不在同一行，逐行 grep 永远匹配不到 —— 结果是每个心跳都重采同一窗口。
               # 只依赖 grep/tr；无匹配时 grep 退出 1，必须吞掉，否则 pipefail 会把空转心跳判失败。
-              done_windows="$(printf '%s' "$window_state" | grep -o '\[[0-9, ]*\]' | head -n 1 | tr -cd '0-9,' | tr ',' ' ' || true)"
+              done_windows="$(printf '%s' "$window_state" | tr -d '\n' | grep -o '\[[0-9, ]*\]' | head -n 1 | tr -cd '0-9,' | tr ',' ' ' || true)"
             else
               done_windows=""
             fi
