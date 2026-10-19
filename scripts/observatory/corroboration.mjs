@@ -365,6 +365,22 @@ async function searchGoogleNews(seed, config, options) {
   return entries;
 }
 
+/**
+ * 复核通道可以单独配一把密钥：<PROVIDER>_SEARCH_CORROB_API_KEY。
+ *
+ * 为什么：复核和发现是两笔账。发现要站点多样性（Brave 强），复核要判据
+ * （DeepSeek 的 summary/authority/rerank_score 直接可用）。两家混用一把 key 时
+ * 「复核用另一个账户的额度」这件事做不到，只能整站换 key。
+ *
+ * 没配专属密钥时回退到主搜索那把 —— 老部署不用改任何东西。
+ */
+function corroborationKey(searchProvider) {
+  const name = String(searchProvider?.apiKeyEnv ?? "");
+  if (!name) return "";
+  const dedicated = name.replace(/_API_KEY$/, "_CORROB_API_KEY");
+  return process.env[dedicated] || process.env[name] || "";
+}
+
 /** 通道三：网页搜索（Brave）。额度紧，默认关闭。
  * 打开后每次唤醒多花 corroboration.braveQueriesPerRun 次搜索额度，
  * 2026-02 起 Brave 免费版是按月 $5 信用（约 1000 次），开着要盯用量。
@@ -372,7 +388,7 @@ async function searchGoogleNews(seed, config, options) {
 async function searchWebProvider(seed, config, searchProvider, options) {
   const settings = config?.corroboration?.channels?.brave ?? {};
   if (settings.enabled !== true) return [];
-  const apiKey = process.env[searchProvider.apiKeyEnv];
+  const apiKey = corroborationKey(searchProvider);
   if (!apiKey || !searchProvider.baseUrl) return [];
   const { query } = buildSearchQuery(seed, settings);
   if (!query) return null;
@@ -454,7 +470,7 @@ async function searchDeepSeek(seed, config, searchProvider, options) {
   const settings = config?.corroboration?.channels?.deepseek ?? {};
   if (settings.enabled !== true) return [];
   if (!searchProvider?.baseUrl) return null;
-  const apiKey = process.env[searchProvider.apiKeyEnv];
+  const apiKey = corroborationKey(searchProvider);
   if (!apiKey) return null;
   const { language, query } = buildSearchQuery(seed, settings);
   if (!query) return null;
