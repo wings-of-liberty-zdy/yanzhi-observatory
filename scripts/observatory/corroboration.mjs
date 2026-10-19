@@ -387,7 +387,6 @@ function corroborationKey(searchProvider) {
  */
 async function searchWebProvider(seed, config, searchProvider, options) {
   const settings = config?.corroboration?.channels?.brave ?? {};
-  if (settings.enabled !== true) return [];
   const apiKey = corroborationKey(searchProvider);
   if (!apiKey || !searchProvider.baseUrl) return [];
   const { query } = buildSearchQuery(seed, settings);
@@ -468,7 +467,6 @@ async function searchWebProvider(seed, config, searchProvider, options) {
  */
 async function searchDeepSeek(seed, config, searchProvider, options) {
   const settings = config?.corroboration?.channels?.deepseek ?? {};
-  if (settings.enabled !== true) return [];
   if (!searchProvider?.baseUrl) return null;
   const apiKey = corroborationKey(searchProvider);
   if (!apiKey) return null;
@@ -534,9 +532,15 @@ async function searchDeepSeek(seed, config, searchProvider, options) {
   }
 }
 
-async function searchChannel(channel, seed, config, providers, options) {
+async function searchChannel(channel, seed, config, providers, options, corroborationProvider) {
   if (channel.id === "hackernews") return searchHackerNews(seed, config, options);
   if (channel.id === "googlenews") return searchGoogleNews(seed, config, options);
+  if (channel.id === "paid") {
+    if (!corroborationProvider) return [];
+    return corroborationProvider.protocol === "deepseek"
+      ? searchDeepSeek(seed, config, corroborationProvider, options)
+      : searchWebProvider(seed, config, corroborationProvider, options);
+  }
   if (channel.id === "web") return searchWebProvider(seed, config, providers.brave, options);
   if (channel.id === "deepseek") return searchDeepSeek(seed, config, providers.byId[channel.providerId], options);
   return [];
@@ -556,6 +560,8 @@ export async function collectCorroborations(input) {
   const stats = { seeds: seeds.length, channels: {}, matches: 0, paidQueries: 0 };
   if (settings.enabled !== true || seeds.length === 0) return { matches: [], stats };
   const searchProviders = providerConfig?.searchProviders ?? {};
+  const corroborationId = String(providerConfig?.activeCorroborationSearch ?? "").trim();
+  const corroborationProvider = corroborationId ? searchProviders[corroborationId] : null;
   const providers = {
     active: searchProviders[providerConfig?.activeSearch],
     // web 通道固定用 Brave 服务商，不跟主搜索走：两条通道请求形状不同
@@ -564,13 +570,29 @@ export async function collectCorroborations(input) {
     brave: searchProviders.brave ?? searchProviders[providerConfig?.activeSearch],
     byId: searchProviders,
   };
-  // configKey 与通道 id 不一定同名：网页搜索的配置块叫 brave。
+  /*
+   * 复核搜索与主搜索平级：配了 activeCorroborationSearch 就只跑那一家
+   * （额度按它的协议从同名通道配置里取），没配则保持旧行为
+   * （web + deepseek 两条通道各看自己的 enabled）。
+   */
   const channels = [
     { id: "hackernews", configKey: "hackernews", label: "Hacker News" },
     { id: "googlenews", configKey: "googlenews", label: "Google 新闻" },
-    { id: "web", configKey: "brave", label: "网页搜索", metered: true },
-    { id: "deepseek", configKey: "deepseek", label: "DeepSeek 搜索", providerId: "deepseek", metered: true },
   ];
+  if (corroborationProvider) {
+    const configKey = corroborationProvider.protocol === "deepseek" ? "deepseek" : "brave";
+    channels.push({
+      id: "paid",
+      configKey,
+      label: `${corroborationProvider.label ?? corroborationId}（复核）`,
+      metered: true,
+    });
+  } else {
+    channels.push(
+      { id: "web", configKey: "brave", label: "网页搜索", metered: true },
+      { id: "deepseek", configKey: "deepseek", label: "DeepSeek 搜索", providerId: "deepseek", metered: true },
+    );
+  }
   const metered = new Set(channels.filter((channel) => channel.metered).map((channel) => channel.id));
   const maximumMatchesPerSeed = Math.max(1, Number(settings.maximumMatchesPerSeed ?? 2));
   const seenUrls = new Set(knownUrls ?? []);
@@ -580,7 +602,8 @@ export async function collectCorroborations(input) {
   for (const seed of seeds) {
     for (const channel of channels) {
       // 关闭的通道不进统计：统计里的 queries 必须等于真实发出的请求数。
-      if (settings.channels?.[channel.configKey]?.enabled !== true) continue;
+      // paid 通道不受 channels.enabled 限制：activeCorroborationSearch 本身就是选择。
+      if (channel.id !== "paid" && settings.channels?.[channel.configKey]?.enabled !== true) continue;
       if (metered.has(channel.id)) {
         // 付费搜索按次计费，不能每个种子都花一次：每个通道只给排在最前面的几个种子用。
         const used = searchesUsed.get(channel.id) ?? 0;
@@ -592,7 +615,7 @@ export async function collectCorroborations(input) {
       stats.channels[channel.id] = channelStat;
       let results;
       try {
-        results = await searchChannel(channel, seed, config, providers, { discoveredAt });
+        results = await searchChannel(channel, seed, config, providers, { discoveredAt }, corroborationProvider);
       } catch (error) {
         channelStat.queries += 1;
         channelStat.failures += 1;

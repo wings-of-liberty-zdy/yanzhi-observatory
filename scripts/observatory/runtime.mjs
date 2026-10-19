@@ -72,6 +72,10 @@ export async function readProviderConfig() {
   if (config?.schemaVersion !== 1) throw new Error("Unsupported provider config schemaVersion.");
   if (!config.llmProviders?.[config.activeLlm]) throw new Error("Active LLM provider is not configured.");
   if (!config.searchProviders?.[config.activeSearch]) throw new Error("Active search provider is not configured.");
+  // 复核搜索与主搜索平级，可以单独选一家；留空表示跟随主搜索（旧配置）。
+  if (config.activeCorroborationSearch && !config.searchProviders?.[config.activeCorroborationSearch]) {
+    throw new Error("Active corroboration search provider is not configured.");
+  }
   const officialOrigins = {
     deepseek: "https://api.deepseek.com",
     openai: "https://api.openai.com",
