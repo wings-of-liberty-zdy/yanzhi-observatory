@@ -354,6 +354,9 @@ jobs:
       - name: Open or update failure issue
         env:
           GH_TOKEN: ${{ github.token }}
+          # gh 在这个 job 里跑在非 git 工作目录（没 checkout），不显式给仓库就会报
+          # fatal: not a git repository —— 2026-10-18 起 9 次失败一次 issue 都没开出来。
+          GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CANDIDATE_SYNC_OUTCOME: ${{ needs.observatory.outputs.candidate_sync }}
           PUBLISH_OUTCOME: ${{ needs.observatory.outputs.publish }}
