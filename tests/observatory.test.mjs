@@ -992,7 +992,8 @@ test("同题反查命中挂到种子上，且不单独占候选席位", async ()
   const preferences = { topicAdjustments: {}, sourceTrust: {}, trackedQuestions: [], actions: [] };
   const history = { keys: new Set(), urls: new Set() };
   try {
-    const seeds = selectCorroborationSeeds(pool, config, preferences, history, "2026-10-06");
+    // 种子现在直接来自短名单，不再由反查自己去猜谁会入选（2026-10-19 改动）。
+    const seeds = selectCorroborationSeeds(pool, config);
     assert.equal(seeds.length, 2);
     const { matches, stats } = await collectCorroborations({
       seeds,
@@ -1024,6 +1025,52 @@ test("同题反查命中挂到种子上，且不单独占候选席位", async ()
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("反查种子取自最终短名单，同主题最多两条且不重复", async () => {
+  /*
+   * 2026-10-19 把反查从 collect 挪到 generate 之后，种子就是 selectCandidates() 的产物。
+   * 这条用例钉住四件事：① 顺序＝短名单顺序，不再自己重排；② 常青栏目、过短标题、
+   * 榜单页不上场；③ 同主题默认最多 2 条，避免同题集中的一天被一个主题吃光额度；
+   * ④ 每一轮不会把上一轮取过的种子再取一遍（perTopicCap≥2 时才会暴露的重复 bug）。
+   */
+  const config = await readConfig();
+  config.corroboration = {
+    ...config.corroboration,
+    enabled: true,
+    maximumSeeds: 5,
+    maximumSeedsPerTopic: 2,
+    minimumTitleCharacters: 12,
+  };
+  const make = (id, topicHint, title, url, extra = {}) => ({
+    id,
+    topicHint,
+    title,
+    url,
+    excerpt: "摘要",
+    publishedAt: "2026-10-18T08:00:00.000Z",
+    source: { id: `src-${id}`, trust: 0.8 },
+    laneHint: "focus",
+    typeHint: "news",
+    ...extra,
+  });
+  const shortlist = [
+    make("pg1", "postgraduate", "中科院自动化所硕士统考复试与录取口径", "https://ia.cas.cn/a"),
+    make("pg2", "postgraduate", "中国科学技术大学自动化系硕士招生简章", "https://auto.ustc.edu.cn/b"),
+    make("pg3", "postgraduate", "清华大学自动化系硕士研究生招生目录", "https://tsinghua.edu.cn/c"),
+    make("ai1", "ai", "微软首席执行官谈让视窗系统更安全地运行智能体", "https://techmeme.com/d"),
+    make("ai2", "ai", "从候选里挑推理句子：受限模型少走弯路", "https://machinelearning.apple.com/e", { evergreen: true }),
+    make("short", "ai", "短标题", "https://example.com/f"),
+    make("list", "world", "全球机器人公司榜单", "https://example.com/best-robots"),
+  ];
+  const seeds = selectCorroborationSeeds(shortlist, config);
+  assert.deepEqual(seeds.map((seed) => seed.id), ["pg1", "ai1", "pg2"]);
+  assert.equal(new Set(seeds).size, seeds.length);
+  // 关掉 corroboration 就一条都不查。
+  assert.deepEqual(
+    selectCorroborationSeeds(shortlist, { ...config, corroboration: { ...config.corroboration, enabled: false } }),
+    [],
+  );
 });
 
 test("DeepSeek 复核通道：POST + Bearer、只认 results[]、空手而归不计费", async () => {

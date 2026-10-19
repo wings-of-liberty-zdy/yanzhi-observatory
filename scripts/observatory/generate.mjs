@@ -21,8 +21,11 @@ import {
   writeJsonAtomic,
 } from "./runtime.mjs";
 import { publicIssueFiles, readEvergreenHistory, requiredDailyTypes, selectCandidates } from "./ranking.mjs";
+import { collectCorroborations, selectCorroborationSeeds } from "./corroboration.mjs";
 
 const dryRun = process.argv.includes("--dry-run");
+/** 允许在 --dry-run 下一并试跑同题反查（付费通道会真花额度，只给验证用）。 */
+const corroborateInDryRun = process.argv.includes("--corroborate");
 const stageArg = process.argv.find((argument) => argument.startsWith("--stage="));
 const stage = stageArg?.split("=")[1] ?? "final";
 if (!new Set(["midday", "final"]).has(stage)) throw new Error("--stage must be midday or final.");
@@ -498,13 +501,43 @@ if (candidateDiversity.distinct < Number(config.editorialRules?.minimumDistinctP
 
 const provider = providerConfig.llmProviders[providerConfig.activeLlm];
 /*
- * 同题反查的佐证候选随候选池一起持久化（collect 写入、generate 读取）。
- * 只取「种子确实进了今晚候选池」的那些；其余不喂给模型，避免给一堆用不上的 id。
+ * 同题反查（2026-10-19 起在这里做）。
+ *
+ * 反查的种子就是上面那份短名单本身——它才是今晚真会进模型的候选。放在采集阶段做，
+ * 等于拿几小时前的排名猜谁会入选：10-18 实测猜出的种子一条都没进最终短名单，
+ * 25 次付费搜索全部落空（详见 corroboration.mjs 的 selectCorroborationSeeds）。
+ * 命中的第二家报道仍然不单独成条，只挂在种子旁边进提示词，由模型判断要不要一并引用。
+ * 顺序上它排在模型调用之前：先过完 minimumItems / 来源多样性两道校验，不会为一份注定
+ * 失败的生成白花搜索额度。
  */
-const selectedIds = new Set(selected.map((candidate) => candidate.id));
+const corroborationSeeds = selectCorroborationSeeds(selected, config);
+let corroborationMatches = [];
+let corroborationStats = null;
+let corroborationSkipped = null;
+if (corroborationSeeds.length === 0) {
+  corroborationSkipped = config.corroboration?.enabled === true ? "no-eligible-seed" : "disabled";
+} else if (dryRun && !corroborateInDryRun) {
+  // dry-run 默认零外呼；要真打就加 --corroborate（付费通道按次计费）。
+  corroborationSkipped = "dry-run";
+} else {
+  try {
+    const result = await collectCorroborations({
+      seeds: corroborationSeeds,
+      config,
+      providerConfig,
+      // 反查发生在生成这一刻，用当下时间而不是候选池的采集时间。
+      discoveredAt: nowInstant.toISOString(),
+      // 池里已有的 URL 一律不当第二来源：同一篇页面既做候选又做佐证没有意义。
+      knownUrls: (candidatesDocument.items ?? []).map((candidate) => candidate.url),
+    });
+    corroborationMatches = result.matches;
+    corroborationStats = result.stats;
+  } catch (error) {
+    console.warn(`[corroboration] ${error.message}`);
+  }
+}
 const corroborationsBySeed = new Map();
-for (const candidate of candidatesDocument.items ?? []) {
-  if (!candidate?.corroboratesSeed || !selectedIds.has(candidate.corroboratesSeed)) continue;
+for (const candidate of corroborationMatches) {
   const list = corroborationsBySeed.get(candidate.corroboratesSeed) ?? [];
   list.push(candidate);
   corroborationsBySeed.set(candidate.corroboratesSeed, list);
@@ -524,11 +557,18 @@ if (dryRun) {
     requiredSecret: provider.apiKeyEnv,
     promptBytes,
     selectedCandidates: selected.map(({ id, title, topicHint, laneHint, subtopicHint, score }) => ({ id, title, topicHint, subtopicHint, laneHint, score })),
+    // 计划要反查的种子是免费的（只看短名单），所以 dry-run 也能看到它的形状；
+    // 真打没打看 skipped，打了多少付费请求看 corroboration.paidQueries。
+    corroborationSeeds: corroborationSeeds.map(({ id, title, topicHint, source }) => ({ id, title, topicHint, source: source?.name })),
+    corroborationSkipped,
+    corroboration: corroborationStats
+      ? { matches: corroborationStats.matches, paidQueries: corroborationStats.paidQueries, channels: corroborationStats.channels }
+      : null,
     corroborations: [...corroborationsBySeed.entries()].map(([seedId, entries]) => ({
       seedId,
       candidates: entries.map((entry) => ({ id: entry.id, title: entry.title, source: entry.source.name })),
     })),
-    paidCalls: 0,
+    paidCalls: corroborationStats?.paidQueries ?? 0,
     usageWritten: false,
   }, null, 2));
   process.exit(0);
@@ -679,5 +719,14 @@ console.log(JSON.stringify({
     unmetered: generated.usage.unmetered,
   },
   estimatedCny,
+  // 反查花了多少、换回什么，跟着生成这一步一起报：额度是否白花，看这行就够了。
+  corroboration: {
+    seeds: corroborationSeeds.map(({ id, title }) => ({ id, title })),
+    skipped: corroborationSkipped,
+    matches: corroborationMatches.length,
+    multiSourceSeeds: corroborationsBySeed.size,
+    paidQueries: corroborationStats?.paidQueries ?? 0,
+    channels: corroborationStats?.channels ?? null,
+  },
   target: previewPath,
 }, null, 2));

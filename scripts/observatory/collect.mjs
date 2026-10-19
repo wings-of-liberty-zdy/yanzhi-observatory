@@ -37,16 +37,12 @@ import {
   distillEvergreenCandidates,
   readRecentDigest,
 } from "./distillation.mjs";
-import { collectCorroborations, selectCorroborationSeeds } from "./corroboration.mjs";
 import { classifySearchFailure } from "./search-health.mjs";
-import { readEvergreenHistory, requiredDailyTypes, selectCandidates } from "./ranking.mjs";
 
 const dryRun = process.argv.includes("--dry-run");
 const noPaidSearch = process.argv.includes("--no-paid-search");
 /** 允许在 --dry-run 下一并试跑素材蒸馏（默认 dry-run 不花钱、不调 LLM）。 */
 const distillInDryRun = process.argv.includes("--distill");
-/** 允许在 --dry-run 下一并试跑同题反查（免费通道不花钱，但会产生网络请求）。 */
-const corroborateInDryRun = process.argv.includes("--corroborate");
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@",
@@ -1076,53 +1072,16 @@ const pool = deduplicate([
   .filter((candidate) => preferences.sourceTrust?.[candidate.source.id] !== "blocked");
 
 /*
- * 同题反查：多源一致没有材料，是因为采集从来只问「这个方向有什么新东西」，
- * 没问「这件事还有谁报道」。这里对最可能入选的种子补问一次，
- * 命中的第二家报道挂到种子旁边进提示词，由模型决定要不要一并引用。
- * 反查候选不单独占候选席位（ranking.mjs 会把 corroboratesSeed 的条目挡在外面）。
+ * 同题反查（corroboration）不在这里做。
+ *
+ * 2026-10-19 之前它在采集阶段挑种子反查，种子按「采集当时的排名」猜谁最可能入选；
+ * 实测 10-18：猜出的种子过了 3.5 小时一条都没进短名单，25 次付费搜索全部落空，
+ * 做出来的佐证候选还留在了池子里（其中一条的种子已被挤出池子，成了永远的孤儿）。
+ * 现在改由 generate.mjs 在 selectCandidates() 之后对入选候选做定向反查——
+ * 谁值得花这一次搜索，只有短名单定下来才知道。
  */
-let corroborationItems = [];
-let corroborationSeedCount = 0;
-let corroborationStats = null;
-if (config.corroboration?.enabled === true && (!dryRun || corroborateInDryRun)) {
-  try {
-    const evergreenHistory = await readEvergreenHistory(observatoryPaths.publicIssues);
-    /*
-     * 种子优先取「今晚真会进模型的那份短名单」，而不是分数榜前列：
-     * 分数榜前列实测被招聘站与招考通知占满（那类标题在新闻检索里本来就没有第二家报道），
-     * 而短名单才是这些条目会以什么来源出现在日报里。短名单算不出来时退回分数榜。
-     */
-    let seedPool = pool;
-    try {
-      const shortlist = selectCandidates(
-        pool,
-        config,
-        preferences,
-        evergreenHistory,
-        requiredDailyTypes(config, date),
-        date,
-      );
-      if (shortlist.length > 0) seedPool = shortlist;
-    } catch (error) {
-      console.warn(`[corroboration] 短名单不可用，改用分数前列做种子：${error.message}`);
-    }
-    const seeds = selectCorroborationSeeds(seedPool, config, preferences, evergreenHistory, date);
-    corroborationSeedCount = seeds.length;
-    const result = await collectCorroborations({
-      seeds,
-      config,
-      providerConfig,
-      discoveredAt,
-      knownUrls: pool.map((candidate) => candidate.url),
-    });
-    corroborationItems = result.matches;
-    corroborationStats = result.stats.channels;
-  } catch (error) {
-    console.warn(`[corroboration] ${error.message}`);
-  }
-}
 
-const items = deduplicate([...pool, ...corroborationItems])
+const items = deduplicate(pool)
   .filter((candidate) => !isCompetitionCandidate(candidate))
   .filter((candidate) => candidate.subtopicHint !== "disease-control" || isAllowedHealthRegion(
     candidate.regionHint,
@@ -1156,10 +1115,8 @@ const document = {
     searchFailures: searchHealth.failures,
     searchRejected: searchHealth.rejected,
     searchRateLimited: searchHealth.rateLimited,
-    corroborationSeeds: corroborationSeedCount,
-    corroborationAdded: corroborationItems.length,
-    // 各通道的取数与命中数：0 命中时能分清是「没取回东西」还是「取回了没匹配上」。
-    corroborationChannels: corroborationStats,
+    // 反查的计数搬到了 generate 的输出里：种子从短名单产生，指标跟着那段流水线走。
+    // 快照的 stats 只留采集侧的数字（控台按「数值键才收」解析，缺键不会判废整份快照）。
     total: items.length,
     feedFailures: feedRuns.filter(({ result }) => result.status === "rejected").length,
   },

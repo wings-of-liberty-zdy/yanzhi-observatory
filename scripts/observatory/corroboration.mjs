@@ -1,6 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
 import { matchesBlockedKeywords } from "./content-policy.mjs";
-import { rankCandidates } from "./ranking.mjs";
 import {
   candidateId,
   canonicalUrl,
@@ -23,9 +22,13 @@ import {
  *
  * 这里的做法是反过来问：已经选出的种子候选，还有谁报道了同一件事？
  * 三个通道里两个免密钥（Hacker News Algolia、Google News RSS），
- * 一个走已配置的网页搜索（Brave，额度紧，默认关闭）。
+ * 一个走已配置的网页搜索（Brave / DeepSeek，按次计费）。
  * 命中结果不单独成条，只作为种子的 corroboration 挂在它旁边进提示词，
  * 由模型确认是否真是同一件事、要不要一并引用。
+ *
+ * 调用时机（2026-10-19 起）：在 generate.mjs 里、selectCandidates() 之后。
+ * 「谁值得反查」这件事只有短名单定下来才知道；放在采集阶段等于拿几小时前的猜测
+ * 去花搜索额度（见 selectCorroborationSeeds 的说明）。
  */
 
 const xmlParser = new XMLParser({
@@ -178,37 +181,50 @@ export function toCorroborationCandidate(seed, entry, channel, discoveredAt, con
 }
 
 /**
- * 种子挑选：按现有排序取最可能入选、且不是常青栏目的若干条。
+ * 反查种子＝今晚真会进模型的那份短名单本身。
  *
- * 两点讲究：
+ * 2026-10-19 之前这里吃的是整个候选池，按采集当时的排名自己猜「谁最可能入选」。
+ * 实测 10-18：猜出来的种子过了 3.5 小时一条都不在出刊短名单里（有一条甚至已经被
+ * 行上限 300 条挤出池子），25 次搜索全部落空。所以现在由 generate.mjs 在
+ * selectCandidates() 之后调用——种子与短名单同源，也就不会再有「佐证挂在一个
+ * 已不在池中的种子名下」这种孤儿。
+ *
+ * 两点讲究照旧：
  *   1. 常青栏目（ai-tip / ai-know / tool-pick）不需要第二来源，也查不到同题报道；
- *   2. 按主题轮流取（每主题先取一条，再取第二条），否则同题反查的查询额度会被
- *      单个主题占满——实测 2026-10-06 分数榜前五全是招聘站页面，一个主题吃掉全部额度。
+ *   2. 按主题轮流取，避免单个主题吃掉全部额度。短名单本身已经做过来源平衡，
+ *      这里只是最后一道保险，所以默认上限放宽到 2（1 会让同题集中的一天用不满额度）。
  */
-export function selectCorroborationSeeds(pool, config, preferences, history, date) {
+export function selectCorroborationSeeds(shortlist, config) {
   const settings = config?.corroboration ?? {};
   const maximum = Math.max(0, Number(settings.maximumSeeds ?? 5));
   if (settings.enabled !== true || maximum === 0) return [];
   const minimumTitleCharacters = Math.max(1, Number(settings.minimumTitleCharacters ?? 12));
-  const perTopicCap = Math.max(1, Number(settings.maximumSeedsPerTopic ?? 1));
-  const eligible = rankCandidates(pool, config, preferences, history, date)
+  const perTopicCap = Math.max(1, Number(settings.maximumSeedsPerTopic ?? 2));
+  const eligible = (shortlist ?? [])
     .filter((candidate) => candidate.evergreen !== true)
-    .filter((candidate) => !candidate.corroboratesSeed)
     .filter((candidate) => String(candidate.title ?? "").trim().length >= minimumTitleCharacters)
     .filter((candidate) => !isListingUrl(candidate.url));
-  const selected = [];
+  const seeds = [];
+  const taken = new Set();
   const counts = new Map();
-  for (let round = 0; round < perTopicCap && selected.length < maximum; round += 1) {
+  /*
+   * 按主题轮流取：第 round 轮取每个主题的第 round+1 条。
+   * taken 不能省——内层每次都从 eligible 头部重扫，没有它第二轮会把第一轮取过的
+   * 那条再取一遍（perTopicCap 为 1 时看不出来，改成 2 就成了重复种子）。
+   */
+  for (let round = 0; round < perTopicCap && seeds.length < maximum; round += 1) {
     for (const candidate of eligible) {
-      if (selected.length >= maximum) break;
+      if (seeds.length >= maximum) break;
+      if (taken.has(candidate)) continue;
       const topic = String(candidate.topicHint ?? "unknown");
       const count = counts.get(topic) ?? 0;
       if (count > round) continue;
+      taken.add(candidate);
       counts.set(topic, count + 1);
-      selected.push(candidate);
+      seeds.push(candidate);
     }
   }
-  return selected;
+  return seeds;
 }
 
 function googleNewsItems(parsed) {
@@ -505,7 +521,7 @@ async function searchDeepSeek(seed, config, searchProvider, options) {
 async function searchChannel(channel, seed, config, providers, options) {
   if (channel.id === "hackernews") return searchHackerNews(seed, config, options);
   if (channel.id === "googlenews") return searchGoogleNews(seed, config, options);
-  if (channel.id === "web") return searchWebProvider(seed, config, providers.active, options);
+  if (channel.id === "web") return searchWebProvider(seed, config, providers.brave, options);
   if (channel.id === "deepseek") return searchDeepSeek(seed, config, providers.byId[channel.providerId], options);
   return [];
 }
@@ -519,20 +535,27 @@ async function searchChannel(channel, seed, config, providers, options) {
 export async function collectCorroborations(input) {
   const { seeds, config, providerConfig, discoveredAt, knownUrls } = input;
   const settings = config?.corroboration ?? {};
-  const stats = { seeds: seeds.length, channels: {}, matches: 0 };
+  // paidQueries 单独记一笔：调用方（generate 的日志与 --dry-run 输出）要靠它说清
+  // 「这次免费跑到了什么程度」，不能把免密钥通道的请求也算成花钱。
+  const stats = { seeds: seeds.length, channels: {}, matches: 0, paidQueries: 0 };
   if (settings.enabled !== true || seeds.length === 0) return { matches: [], stats };
   const searchProviders = providerConfig?.searchProviders ?? {};
   const providers = {
     active: searchProviders[providerConfig?.activeSearch],
+    // web 通道固定用 Brave 服务商，不跟主搜索走：两条通道请求形状不同
+    // （Brave 是 GET + X-Subscription-Token + web.results，DeepSeek 是 POST + Bearer + results），
+    // 拿主搜索的 provider 去发另一种形状的请求只会 4xx。主搜索切走时保留 Brave 通道的能力。
+    brave: searchProviders.brave ?? searchProviders[providerConfig?.activeSearch],
     byId: searchProviders,
   };
   // configKey 与通道 id 不一定同名：网页搜索的配置块叫 brave。
   const channels = [
     { id: "hackernews", configKey: "hackernews", label: "Hacker News" },
     { id: "googlenews", configKey: "googlenews", label: "Google 新闻" },
-    { id: "web", configKey: "brave", label: "网页搜索" },
-    { id: "deepseek", configKey: "deepseek", label: "DeepSeek 搜索", providerId: "deepseek" },
+    { id: "web", configKey: "brave", label: "网页搜索", metered: true },
+    { id: "deepseek", configKey: "deepseek", label: "DeepSeek 搜索", providerId: "deepseek", metered: true },
   ];
+  const metered = new Set(channels.filter((channel) => channel.metered).map((channel) => channel.id));
   const maximumMatchesPerSeed = Math.max(1, Number(settings.maximumMatchesPerSeed ?? 2));
   const seenUrls = new Set(knownUrls ?? []);
   const matches = [];
@@ -542,7 +565,7 @@ export async function collectCorroborations(input) {
     for (const channel of channels) {
       // 关闭的通道不进统计：统计里的 queries 必须等于真实发出的请求数。
       if (settings.channels?.[channel.configKey]?.enabled !== true) continue;
-      if (channel.id === "web" || channel.id === "deepseek") {
+      if (metered.has(channel.id)) {
         // 付费搜索按次计费，不能每个种子都花一次：每个通道只给排在最前面的几个种子用。
         const used = searchesUsed.get(channel.id) ?? 0;
         const maximumSearches = Math.max(0, Number(settings.channels?.[channel.configKey]?.maximumSearchesPerRun ?? 2));
@@ -557,6 +580,7 @@ export async function collectCorroborations(input) {
       } catch (error) {
         channelStat.queries += 1;
         channelStat.failures += 1;
+        if (metered.has(channel.id)) stats.paidQueries += 1;
         console.warn(`[corroboration] ${channel.label} ${seed.id}: ${error.message}`);
         continue;
       }
@@ -566,6 +590,7 @@ export async function collectCorroborations(input) {
         continue;
       }
       channelStat.queries += 1;
+      if (metered.has(channel.id)) stats.paidQueries += 1;
       channelStat.results += results.length;
       let accepted = 0;
       for (const entry of results) {
@@ -594,7 +619,7 @@ export async function collectCorroborations(input) {
         .map(([id, stat]) =>
           `${id} 查询 ${stat.queries} / 跳过 ${stat.skipped} / 取回 ${stat.results} / 失败 ${stat.failures} / 命中 ${stat.matched}`)
         .join("；") +
-      `；新增佐证候选 ${matches.length} 条`,
+      `；新增佐证候选 ${matches.length} 条；付费请求 ${stats.paidQueries} 次`,
   );
   return { matches, stats };
 }
