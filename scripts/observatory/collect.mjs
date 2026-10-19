@@ -595,7 +595,10 @@ async function collectToolDiscovery(config, discoveredAt) {
 }
 
 async function braveSearch(queryConfig, config, searchProvider, discoveredAt) {
-  const apiKey = process.env[searchProvider.apiKeyEnv];
+  // 主搜索可以单独一把 key：<PROVIDER>_SEARCH_PRIMARY_API_KEY 优先，回退到 provider 的默认 env。
+  // 这样「主搜索换一家用新额度、复核继续用旧那把」不必整站换 key。
+  const primaryKeyEnv = String(searchProvider.apiKeyEnv ?? "").replace(/_API_KEY$/, "_PRIMARY_API_KEY");
+  const apiKey = process.env[primaryKeyEnv] || process.env[searchProvider.apiKeyEnv];
   if (!apiKey || noPaidSearch || !searchProvider.baseUrl) return [];
   const estimatedCny =
     (config.budget.braveSearchUsdPerThousand / 1000) * config.budget.usdToCny;
@@ -724,7 +727,10 @@ async function braveSearch(queryConfig, config, searchProvider, discoveredAt) {
  * 计费口径「5 元 / 1000 次成功请求，无结果不计费」，价格写在 provider 的 cnyPerThousand。
  */
 async function deepseekSearch(queryConfig, config, searchProvider, discoveredAt) {
-  const apiKey = process.env[searchProvider.apiKeyEnv];
+  // 主搜索可以单独一把 key：<PROVIDER>_SEARCH_PRIMARY_API_KEY 优先，回退到 provider 的默认 env。
+  // 这样「主搜索换一家用新额度、复核继续用旧那把」不必整站换 key。
+  const primaryKeyEnv = String(searchProvider.apiKeyEnv ?? "").replace(/_API_KEY$/, "_PRIMARY_API_KEY");
+  const apiKey = process.env[primaryKeyEnv] || process.env[searchProvider.apiKeyEnv];
   if (!apiKey || noPaidSearch || !searchProvider.baseUrl) return [];
   const estimatedCny = Number(searchProvider.cnyPerThousand ?? 0) / 1000;
   const reservation = await reserveBudget(config, estimatedCny, {
@@ -958,11 +964,14 @@ const searchQueryPool = [...(config.searchQueries ?? []), ...directionQueries];
  * 「关键词方向决定还要找哪些新闻」这条路完全依赖搜索，静默失效等于功能不存在。
  */
 const searchKeyEnv = String(searchProvider.apiKeyEnv ?? "").trim();
-const searchEnabled = Boolean(searchProvider.baseUrl && searchKeyEnv && process.env[searchKeyEnv] && !noPaidSearch);
+// 主搜索专属 key（<PROVIDER>_SEARCH_PRIMARY_API_KEY）也算「配好了」。
+const primarySearchKeyEnv = searchKeyEnv.replace(/_API_KEY$/, "_PRIMARY_API_KEY");
+const hasSearchKey = Boolean(process.env[primarySearchKeyEnv] || (searchKeyEnv && process.env[searchKeyEnv]));
+const searchEnabled = Boolean(searchProvider.baseUrl && hasSearchKey && !noPaidSearch);
 const searchDisabledReason = !searchProvider.baseUrl
   ? `搜索来源「${searchProvider.label ?? providerConfig.activeSearch}」处于关闭状态（activeSearch=${providerConfig.activeSearch}）`
-  : (!searchKeyEnv || !process.env[searchKeyEnv])
-    ? `搜索来源「${searchProvider.label ?? providerConfig.activeSearch}」缺少密钥${searchKeyEnv ? `（${searchKeyEnv}）` : ""}`
+  : !hasSearchKey
+    ? `搜索来源「${searchProvider.label ?? providerConfig.activeSearch}」缺少密钥（${searchKeyEnv} 或 ${primarySearchKeyEnv}）`
     : noPaidSearch
       ? "本次运行带了 --no-paid-search"
       : "";
@@ -973,7 +982,7 @@ if (searchDisabledReason && directionQueries.length > 0) {
   );
 }
 const searchHealth = { requests: 0, failures: 0, rejected: 0, rateLimited: 0 };
-if (searchProvider.baseUrl && process.env[searchProvider.apiKeyEnv] && !noPaidSearch && !dryRun) {
+if (searchProvider.baseUrl && hasSearchKey && !noPaidSearch && !dryRun) {
   const offset = Math.floor(now.getTime() / 3_600_000) % searchQueryPool.length;
   const queries = Array.from(
     { length: Math.min(config.collection.braveQueriesPerRun, config.generation.maximumPaidVerifications ?? Infinity, searchQueryPool.length) },

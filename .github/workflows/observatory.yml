@@ -49,6 +49,12 @@ jobs:
       OBSERVATORY_CUSTOM_API_KEY: ${{ secrets.OBSERVATORY_CUSTOM_API_KEY }}
       DEEPSEEK_SEARCH_API_KEY: ${{ secrets.DEEPSEEK_SEARCH_API_KEY }}
       BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
+      # 主搜索与复核可以各用一把 key：PRIMARY 给发现通道，CORROB 给同题反查；
+      # 两个都不配时回退到上面两个默认值。
+      DEEPSEEK_SEARCH_PRIMARY_API_KEY: ${{ secrets.DEEPSEEK_SEARCH_PRIMARY_API_KEY }}
+      BRAVE_SEARCH_PRIMARY_API_KEY: ${{ secrets.BRAVE_SEARCH_PRIMARY_API_KEY }}
+      DEEPSEEK_SEARCH_CORROB_API_KEY: ${{ secrets.DEEPSEEK_SEARCH_CORROB_API_KEY }}
+      BRAVE_SEARCH_CORROB_API_KEY: ${{ secrets.BRAVE_SEARCH_CORROB_API_KEY }}
       OBSERVATORY_ALLOW_CUSTOM_EGRESS: ${{ vars.OBSERVATORY_ALLOW_CUSTOM_EGRESS }}
       # 采集阶段会读 GitHub（工具发现、阮一峰周刊）。匿名调用只有 60 次/小时且按出口 IP 计，
       # Runner 的共享 IP 很容易撞 403；用工作流自带 token 提到 5000 次/小时。
