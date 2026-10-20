@@ -82,6 +82,9 @@ jobs:
           mode="idle"
           auto="false"
           date="$(TZ=Asia/Shanghai date +%F)"
+          # 采集窗口只认「今天」：21:30 前下面的 publish_ceiling 会把 date 改成昨天，
+          # 如果窗口判断也用 date，就会拿昨天的窗口记录判「已完成」，当天第一采永远起不来。
+          today="$date"
           window=""
           now_minutes=$((10#$(TZ=Asia/Shanghai date +%H) * 60 + 10#$(TZ=Asia/Shanghai date +%M)))
           local_time="$(TZ=Asia/Shanghai date +%H%M)"
@@ -120,17 +123,26 @@ jobs:
             fi
 
             # 已发布或尚未到点时，再补尚未完成的当日采集窗口。
+            # 基准是 today 而不是发布上限 date：21:30 前 date 还是昨天，拿它比对会把昨天的
+            # 窗口记录当成今天的，当天第一采就永远起不来（2026-10-20 全天 7 次心跳全空转）。
             if [[ "$mode" != "publish" ]]; then
             latest_sync_date="$(gh api -H 'Accept: application/vnd.github.raw+json' \
               "repos/$REPOSITORY/contents/latest.json?ref=${CANDIDATE_BRANCH}" --jq .date 2>/dev/null || true)"
-            echo "Candidate snapshot date in remote: ${latest_sync_date:-none} (local date $date)"
-            if [[ "$latest_sync_date" == "$date" ]]; then
+            echo "Candidate snapshot date in remote: ${latest_sync_date:-none} (local date $today)"
+            if [[ "$latest_sync_date" == "$today" ]]; then
               window_state="$(gh api -H 'Accept: application/vnd.github.raw+json' \
                 "repos/$REPOSITORY/contents/window-state.json?ref=${CANDIDATE_BRANCH}" 2>/dev/null || echo '{}')"
               # 先压平换行再 grep：sync-candidates.mjs 用 JSON.stringify(..., null, 2) 写的是缩进格式，
               # "windows": [ 与它的 ] 不在同一行，逐行 grep 永远匹配不到 —— 结果是每个心跳都重采同一窗口。
               # 只依赖 grep/tr；无匹配时 grep 退出 1，必须吞掉，否则 pipefail 会把空转心跳判失败。
-              done_windows="$(printf '%s' "$window_state" | tr -d '\n' | grep -o '\[[0-9, ]*\]' | head -n 1 | tr -cd '0-9,' | tr ',' ' ' || true)"
+              flattened_window_state="$(printf '%s' "$window_state" | tr -d '\n')"
+              done_windows="$(printf '%s' "$flattened_window_state" | grep -o '\[[0-9, ]*\]' | head -n 1 | tr -cd '0-9,' | tr ',' ' ' || true)"
+              # 发布心跳也会采集，但只写 latest.json、不写窗口记录，留下的是前一天的窗口列表；
+              # 所以只有 window-state 自己的 date 是今天时，里面的 windows 才算今天的完成情况。
+              window_state_date="$(printf '%s' "$flattened_window_state" | grep -o '"date"[[:space:]]*:[[:space:]]*"[0-9][0-9-]*"' | grep -o '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' | head -n 1 || true)"
+              if [[ "$window_state_date" != "$today" ]]; then
+                done_windows=""
+              fi
             else
               done_windows=""
             fi
