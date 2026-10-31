@@ -3,6 +3,7 @@ import { load } from "cheerio";
 import { XMLParser } from "fast-xml-parser";
 import {
   collectEvergreenCatalog,
+  evergreenSearchFields,
   isAllowedHealthRegion,
   matchesBlockedKeywords,
   toolRepositoryRejection,
@@ -686,6 +687,9 @@ async function braveSearch(queryConfig, config, searchProvider, discoveredAt) {
             : undefined,
           laneHint: queryConfig.lane,
           typeHint: queryConfig.type,
+          // 查询的 type 是固定内容（ai-tip 等）时，结果整条转成固定内容候选：
+          // 这类条目必须先满足 validate 的 evergreen 要求，否则生成阶段直接判废。
+          ...evergreenSearchFields(queryConfig.type, resultUrl),
           discoveredBy: "brave",
           queryId: queryConfig.id,
           // 方向查询（id 形如 direction-<方向>）的结果也标注方向，与 HN/周刊口径一致。
@@ -810,6 +814,8 @@ async function deepseekSearch(queryConfig, config, searchProvider, discoveredAt)
             : undefined,
           laneHint: queryConfig.lane,
           typeHint: queryConfig.type,
+          // 与 braveSearch 同一口径：固定内容查询的结果要带 evergreen 标记与唯一 key。
+          ...evergreenSearchFields(queryConfig.type, resultUrl),
           discoveredBy: "deepseek",
           queryId: queryConfig.id,
           keywordDirections: queryConfig.id.startsWith("direction-")
@@ -983,11 +989,28 @@ if (searchDisabledReason && directionQueries.length > 0) {
 }
 const searchHealth = { requests: 0, failures: 0, rejected: 0, rateLimited: 0 };
 if (searchProvider.baseUrl && hasSearchKey && !noPaidSearch && !dryRun) {
-  const offset = Math.floor(now.getTime() / 3_600_000) % searchQueryPool.length;
-  const queries = Array.from(
-    { length: Math.min(config.collection.braveQueriesPerRun, config.generation.maximumPaidVerifications ?? Infinity, searchQueryPool.length) },
-    (_, index) => searchQueryPool[(offset + index) % searchQueryPool.length],
+  /*
+   * 常驻查询（配置里写 always: true）不参与轮转，每次采集都跑。
+   * 轮转池一小时只覆盖一部分查询，而 ai-tip 这类固定内容是每天必选的：
+   * 轮不到就等于当天没有这类候选，整期日报会卡在生成阶段（2026-10-29 就是这么挂的）。
+   */
+  const alwaysQueries = searchQueryPool.filter((query) => query?.always === true);
+  const rotatingQueries = searchQueryPool.filter((query) => query?.always !== true);
+  const queryBudget = Math.min(
+    config.collection.braveQueriesPerRun,
+    config.generation.maximumPaidVerifications ?? Infinity,
   );
+  const offset = rotatingQueries.length
+    ? Math.floor(now.getTime() / 3_600_000) % rotatingQueries.length
+    : 0;
+  const rotatingSlots = Math.max(0, queryBudget - alwaysQueries.length);
+  const queries = [
+    ...alwaysQueries,
+    ...Array.from(
+      { length: Math.min(rotatingSlots, rotatingQueries.length) },
+      (_, index) => rotatingQueries[(offset + index) % rotatingQueries.length],
+    ),
+  ];
   for (const query of queries) {
     searchHealth.requests += 1;
     try {

@@ -75,6 +75,32 @@ export function collectEvergreenCatalog(catalog, discoveredAt) {
   ];
 }
 
+/** 日刊的必选固定内容：每天各要一条（config.dailyFormats.requiredTypes）。 */
+const evergreenTypes = new Set(["ai-tip", "ai-know", "tool-pick"]);
+
+/**
+ * 搜索结果直接当固定内容：查询配置把 type 写成 ai-tip / ai-know / tool-pick 时，
+ * 这条查询回来的网页就是候选本身，不再只靠素材蒸馏供货。
+ *
+ * 为什么要有这条路（2026-10-31 加）：固定内容原先只有两条供给 —— 常青目录（已耗尽）
+ * 与每天现蒸馏。蒸馏当天没炼出 ai-tip 时，必选位就空着，ranking.mjs 抛
+ * "No unused ai-tip candidate is available."，整期日报停摆、每半小时失败一次。
+ *
+ * 为什么必须 evergreen 且带 key：validate.mjs 对这三类有硬要求，缺 evergreen 或
+ * evergreenKey 直接判废。key 用「类型 + 规范化 URL」的哈希而不是日期，是因为
+ * verify.mjs 对 evergreen 条目做全历史来源 URL 去重 —— 同一个来源页只能当一次固定内容，
+ * 换成同一条查询第二天再搜到，也不会被当成一条新技巧重新发布。
+ *
+ * 返回 null 表示这是普通新闻查询，调用方保持原样。
+ */
+export function evergreenSearchFields(type, url) {
+  if (!evergreenTypes.has(type)) return null;
+  return {
+    evergreen: true,
+    evergreenKey: `${type}:search:${candidateId(url, type)}`,
+  };
+}
+
 export function candidateSourceIdentity(candidate) {
   return sourceIdentity(candidate?.url, candidate?.source?.id);
 }

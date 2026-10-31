@@ -18,6 +18,7 @@ import {
 import {
   collectEvergreenCatalog,
   countAcronyms,
+  evergreenSearchFields,
   matchKeywordDirections,
   matchesBlockedKeywords,
   sourceDiversityReport,
@@ -1263,4 +1264,22 @@ test("搜索健康度把额度耗尽报成需要告警", () => {
   assert.match(broken.reason, /搜索全部失败/);
   // 没有候选池文件时按「没发出请求」处理。
   assert.equal(searchStatusReport(null).ok, true);
+});
+
+test("固定内容的搜索查询：结果带 evergreen，同一来源页只算一次", () => {
+  const fields = evergreenSearchFields("ai-tip", "https://example.com/tips/workflow?utm_source=brave");
+  assert.equal(fields.evergreen, true);
+  assert.match(fields.evergreenKey, /^ai-tip:search:[0-9a-f]{20}$/);
+  // 规范化 URL 之后 key 相同：同一篇文章换了追踪参数或锚点，不会被当成两条新技巧。
+  assert.equal(
+    evergreenSearchFields("ai-tip", "https://example.com/tips/workflow#step-2").evergreenKey,
+    fields.evergreenKey,
+  );
+  // 不同类型各占一个 key，互不挤占。
+  assert.notEqual(
+    evergreenSearchFields("ai-know", "https://example.com/tips/workflow").evergreenKey,
+    fields.evergreenKey,
+  );
+  // 普通新闻查询不转固定内容，调用方保持原样。
+  assert.equal(evergreenSearchFields("news", "https://example.com/tips/workflow"), null);
 });
