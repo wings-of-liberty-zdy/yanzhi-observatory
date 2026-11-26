@@ -39,7 +39,7 @@ import {
 } from "./runtime.mjs";
 import { generateStructured } from "./providers.mjs";
 import { publicIssueFiles, readEvergreenHistory } from "./ranking.mjs";
-import { countAcronyms } from "./content-policy.mjs";
+import { countAcronyms, summaryIsVacuous } from "./content-policy.mjs";
 
 const DISTILLED_TYPES = new Set(["ai-tip", "ai-know", "tool-pick"]);
 
@@ -200,7 +200,9 @@ function buildMessages(config, materials, recentTitles, date) {
     "从给定素材中提炼 3 条固定内容：1 条 ai-tip、1 条 ai-know 与 1 条 tool-pick。三类都是当天日刊的必选内容，请尽力各产出 1 条。",
     "ai-tip：写今天就能照做的操作习惯或技巧。素材里的新功能、新接口、新选项、配置变更与行为变更，都可以写成「怎么用、要改什么、注意什么」的可执行说明；必须具体到能照做，不要停留在「某功能发布了」这种新闻式表述。版本更新与技术变更类素材通常最适合 ai-tip。",
     "ai-tip 的 title 必须写成操作口吻，让人一眼看出「要做什么」或「怎么做」，例如「给代码库建索引，让补全变快」；绝不要写成新闻标题（例如「某功能让补全变快」这种以产品为主语的句式）。",
-    "ai-know：写名词本义、底层方法、易混辨析或能力边界，不要写成技巧。",
+    "素材讲的是某个具体产品（某个助手、编辑器、平台）的做法时，标题与摘要必须点出这个产品名和入口（哪个设置、哪条命令、点哪里），例如「在 Linger 里跑第一个只读任务」；写不出产品名和入口就不要产出这一条 —— 改写成放之四海皆准的通用话等于没写。",
+    "ai-know：写名词本义、底层方法、易混辨析或能力边界，不要写成技巧。摘要必须同时给三样东西：一、这个对象是什么（点名平台、产品或协议）；二、具体机制或清单（素材给了状态名、接口名、数字就照写）；三、适用边界或常见误解。",
+    "禁止把素材的导语改写成结论。凡是「某概念补充了某信息」「打开之外还需要更多状态」这种没有一个具体名字和数字的句子，一律重写；摘要里至少要出现一个可以指认的对象（版本号、状态名、接口名、命令或数字）。",
     "tool-pick：写「今天为什么值得用某个工具」，素材里 kind 为 tool 的条目就是候选工具（来自 GitHub 仓库）。要求：title 直接写工具名或它的用途，不许写成「某类候选条目」这种空话；summary 必须说清这个工具解决什么问题、适合谁、有什么已知限制，只能依据素材描述，不许补造功能或数字。若素材里的仓库与你无关、描述看不懂或与工具无关，宁可省略这一条并在 note 里说明，也不要硬凑。",
     "标题与摘要要少用英文缩写和英文专有名词：GPT-6、Copilot、OpenTelemetry 这类词在一条里合计不超过 2 个，能用中文说清的就用中文说清（例如「可观测性配置」「代码补全助手」）。工具名无法翻译时保留原名即可，但不要在同一句里再堆别的英文缩写。",
     "每条必须绑定素材中真实存在的 url，从素材的 url 字段原样复制，严禁编造或拼接链接。",
@@ -231,6 +233,19 @@ function acceptEntry(entry, materials, expectedType, config) {
   // 这里先做一道宽松兜底，只拦明显超标的，避免刚蒸馏出来就被 generate 丢掉。
   const acronymLimit = Number(config.editorialRules?.maximumAcronymsPerSummary ?? 3) + 2;
   if (countAcronyms(`${title}${summary}`) > acronymLimit) return null;
+
+  /*
+   * 固定栏目要能写成一张有事实的卡片。命中导语式句式又没有一个可指认对象的，直接丢，
+   * 由常青目录兜底 —— 2026-11-25 那条 ai-know 就是这么混过去的（「具体状态补充进度信息」，
+   * 平台名与七种状态全没了）。
+   *
+   * 这里可以硬拦而搜索入池处不能：丢一条还有常青目录补位，不会让整期日报缺栏目。
+   * 同一套判据在 150 条已发布卡片上校过，只误杀 1 条（密钥有效性检查）。
+   */
+  if ((expectedType === "ai-tip" || expectedType === "ai-know") && summaryIsVacuous(`${title} ${summary}`)) {
+    console.log(`[distill] 丢弃空话 ${expectedType}：${title}`);
+    return null;
+  }
 
   // 来源必须真实存在于素材里：不信任模型自述的链接。
   const target = canonicalUrl(entry.sourceUrl);

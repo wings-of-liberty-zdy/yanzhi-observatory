@@ -4,6 +4,7 @@ import { XMLParser } from "fast-xml-parser";
 import {
   collectEvergreenCatalog,
   evergreenSearchFields,
+  evergreenSearchRejection,
   isAllowedHealthRegion,
   matchesBlockedKeywords,
   toolRepositoryRejection,
@@ -666,7 +667,7 @@ async function braveSearch(queryConfig, config, searchProvider, discoveredAt) {
         if (matchesBlockedKeywords(`${title} ${result.description ?? ""}`, config.toolDiscovery?.blockedKeywords)) {
           return null;
         }
-        return {
+        const candidate = {
           id: candidateId(resultUrl, title),
           title,
           url: resultUrl,
@@ -697,6 +698,17 @@ async function braveSearch(queryConfig, config, searchProvider, discoveredAt) {
             ? [queryConfig.id.slice("direction-".length)]
             : undefined,
         };
+        /*
+         * 固定栏目是每天必选，池子里混进「只有一句导语」的搜索结果，生成阶段只能照着把导语
+         * 换个说法。入池处只挡这种写不出卡片的候选；空话判定不放这里 —— 误杀会抽干必选栏目的
+         * 供给（2026-10-29 与 11-25 都因为没候选停摆过），那是蒸馏与人工复核的活。
+         */
+        const rejection = evergreenSearchRejection(candidate, queryConfig.type);
+        if (rejection) {
+          console.log(`[search] ${queryConfig.id}: 丢弃固定栏目候选（${rejection}）${resultUrl}`);
+          return null;
+        }
+        return candidate;
       })
       .filter(Boolean);
     await settleBudget(config, reservation, {
@@ -793,7 +805,7 @@ async function deepseekSearch(queryConfig, config, searchProvider, discoveredAt)
         if (matchesBlockedKeywords(`${title} ${excerpt ?? ""}`, config.toolDiscovery?.blockedKeywords)) {
           return null;
         }
-        return {
+        const candidate = {
           id: candidateId(resultUrl, title),
           title,
           url: resultUrl,
@@ -822,6 +834,13 @@ async function deepseekSearch(queryConfig, config, searchProvider, discoveredAt)
             ? [queryConfig.id.slice("direction-".length)]
             : undefined,
         };
+        // 与 braveSearch 同一道闸门：写不成具体卡片的固定栏目候选不进池。
+        const rejection = evergreenSearchRejection(candidate, queryConfig.type);
+        if (rejection) {
+          console.log(`[search] ${queryConfig.id}: 丢弃固定栏目候选（${rejection}）${resultUrl}`);
+          return null;
+        }
+        return candidate;
       })
       .filter(Boolean);
     await settleBudget(config, reservation, {

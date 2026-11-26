@@ -101,6 +101,56 @@ export function evergreenSearchFields(type, url) {
   };
 }
 
+/*
+ * 「这张卡片有没有说出一件具体的事」——固定栏目的空话判定。
+ *
+ * 2026-11-25 的两条固定内容都通过了原有校验（字数、拉丁词密度、链接真实性），
+ * 却没有说出一件具体的事：
+ *   ai-tip 取自 w3cschool《Linger 的 Another Me 入门》，产品说明书被通用化成
+ *   「读取内容不等于把内容发出去」，读者既不知道是哪个产品，也做不了任何事；
+ *   ai-know 取自 GitHub 2026-11-23 changelog，原文有七种议题状态、PR 自动流转、
+ *   API/MCP 支持，卡片只剩「具体状态补充进度信息」——平台名与状态名全丢。
+ *
+ * 判据分两段：先认导语式句式（这些句式通常意味着原文的导语被当成了结论），
+ * 再看文案有没有落到一个可指认的点上（数字、英文标识、书名号，或「不能/只能/取决于/
+ * 指的是/例如」这类把话说死的机制词）。
+ *
+ * 这套判据在 150 条已发布卡片上校过：命中 2026-11-25 那两条，另误杀 1 条
+ * （密钥有效性检查）。它只是兜底，不是判决书 —— 所以只在有兜底的蒸馏环节硬拦，
+ * 入池处不判，生成阶段只记日志（原因见 evergreenSearchRejection 与 generate.mjs）。
+ */
+const vacuousPattern = /(?:为什么还要|不只是|不仅是|不等于|让人|帮助[^，。]{0,6}(?:团队|读者)|形成共同理解|补充(?:进度|信息|说明)|提供(?:参考|依据)|某种意义上)/;
+
+const anchorPattern = /(?:\d)|(?:[A-Za-z][A-Za-z0-9_+.-]{2,})|(?:《[^》]{1,30}》)|(?:不能|只能|必须|否则|除非|取决于|不说明|只说明|不代表|指的是|用来|用于|例如|比如|如果|默认|上限|下限|限制|报错|失败|生效|第一步|具体到|区分|区别|不同于|步骤|才能|可以|需要|需|若|应|按|指)/;
+
+export function hasConcreteAnchor(text) {
+  return anchorPattern.test(String(text ?? ""));
+}
+
+/** 空话：命中了导语式句式，且通篇没有一个可指认的对象或机制。 */
+export function summaryIsVacuous(text) {
+  const normalized = String(text ?? "").trim();
+  if (!normalized) return true;
+  return vacuousPattern.test(normalized) && !hasConcreteAnchor(normalized);
+}
+
+/**
+ * 搜索通道来的固定栏目候选，入池前只判一件事：这段正文够不够写出一张卡片。
+ *
+ * 为什么不在这里判空话：同一套启发式在已发布卡片上会误杀一两条好的辨析卡片，
+ * 而固定栏目是每天必选 —— 入池处误杀会抽干供给。2026-10-29 与 11-25 都因为
+ * 「没有可用的固定内容候选」让整期日报停摆过，这个代价比偶尔多一条空话高。
+ *
+ * 空话判定放在两个有兜底的地方：蒸馏（丢一条还有常青目录兜底）与生成阶段的日志告警
+ * （人工在控台换一条）。
+ */
+export function evergreenSearchRejection(candidate, type) {
+  if (type !== "ai-tip" && type !== "ai-know") return null;
+  const excerpt = String(candidate?.excerpt ?? "").trim();
+  if (excerpt.length >= 40) return null;
+  return `正文片段只有 ${excerpt.length} 字，不够写出一张具体卡片`;
+}
+
 export function candidateSourceIdentity(candidate) {
   return sourceIdentity(candidate?.url, candidate?.source?.id);
 }

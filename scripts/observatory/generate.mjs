@@ -4,6 +4,7 @@ import {
   countAcronyms,
   isAllowedHealthRegion,
   sourceDiversityReport,
+  summaryIsVacuous,
 } from "./content-policy.mjs";
 import { validateIssueDocument } from "./validate.mjs";
 import {
@@ -133,6 +134,12 @@ function promptMessages(config, candidates, preferences, date, requiredTypes, co
         `内容允许 news/research/release/opportunity/analysis/ai-tip/ai-know/tool-pick。竞赛完全排除。${requiredTypes.length ? `本期必须且只能各选 1 条固定内容：${requiredTypes.join("、")}。每条固定内容必须单独成条，并且只引用下面点名的候选 id，不得与其他候选合并、不得当作其他条目的佐证、也不得改成其他类型——${requiredSlots}。` : ""}`,
         "岗位内容只用于观察市场，不代表准备申请。最多 1-2 条；opportunity.mode 必须是 observe，location、compensation、responsibilities、requirements 必须填写，来源没说明时写“来源未说明”，不得出现催促投递。",
         "时效优先：今日发生或今日首次见报的新闻权重大幅高于一周内旧闻；优先选上海日历当日发布的条目，一周内旧闻只作补充。ai-tip、ai-know 和 tool-pick 是常青内容，不按新闻时效评价。ai-tip 写今天就能照做的操作习惯；ai-know 写名词本义、底层方法、易混辨析或能力边界，不要写成技巧；tool-pick 写今天为什么值得用某个工具。三类都要避免与历史重复。",
+        /*
+         * 固定栏目的空话问题：2026-11-25 的 ai-tip 是一份产品说明书的通用化改写（读完了不知道该
+         * 用哪个产品做什么），ai-know 是 GitHub 更新日志的导语改写（「具体状态补充进度信息」，
+         * 平台名与七种状态全没了）。两条都满足字数要求，问题在于没有一个可以指认的对象。
+         */
+        "固定栏目必须写成有事实的卡片：ai-tip 要写清用哪个产品/工具、改哪个设置或跑哪条命令；素材讲的是某个具体产品时，标题里点出产品名，不要改写成放之四海皆准的通用话。ai-know 必须点名对象（平台、产品或协议），并写出具体机制、清单或边界，来源给了状态名、接口名、数字就照写。凡是没有可指认对象（版本号、状态名、命令、数字）的摘要，重写成具体版本；不得把来源的导语改写成「某概念补充了某信息」这类同义反复。",
         `整期主来源必须分散：单一网站最多占 ${Math.round((config.editorialRules?.maximumPrimarySourceRatio ?? 0.4) * 100)}%，至少使用 ${config.editorialRules?.minimumDistinctPrimarySources ?? 4} 个不同主来源。`,
         horizonInstruction,
         "视野之外优先：与未来相关 > 公共影响 > 跨学科拓界 > 反方与盲区。只有明显突出的内容才 featured=true，最多一条。",
@@ -608,7 +615,7 @@ for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
         ...messages,
         {
           role: "user",
-          content: `上一份输出不是完整有效且可校验的 JSON。重新生成一次：只输出单个 JSON 对象，共 ${config.generation.minimumItems}-${config.generation.maximumItems} 条；每条必须引用候选数据中的真实 candidateIds；每条摘要 ${config.generation.summaryMinimumCharacters}-${config.generation.summaryMaximumCharacters} 个中文字符，标题与摘要里的英文缩写合计不超过 ${Number(config.editorialRules?.maximumAcronymsPerSummary ?? 3)} 个；视野之外的条目不得少于 ${Math.min(Math.max(1, Math.min(selected.filter((candidate) => candidate.laneHint === "horizon").length, 2)), config.generation.maximumItems)} 条。`,
+          content: `上一份输出不是完整有效且可校验的 JSON。重新生成一次：只输出单个 JSON 对象，共 ${config.generation.minimumItems}-${config.generation.maximumItems} 条；每条必须引用候选数据中的真实 candidateIds；每条摘要 ${config.generation.summaryMinimumCharacters}-${config.generation.summaryMaximumCharacters} 个中文字符，标题与摘要里的英文缩写合计不超过 ${Number(config.editorialRules?.maximumAcronymsPerSummary ?? 3)} 个；视野之外的条目不得少于 ${Math.min(Math.max(1, Math.min(selected.filter((candidate) => candidate.laneHint === "horizon").length, 2)), config.generation.maximumItems)} 条；固定栏目（ai-tip / ai-know）的摘要必须写出具体对象或数字，不得把来源导语改写成同义反复。`,
         },
       ];
   try {
@@ -704,6 +711,23 @@ const validatedIssue = validateIssueDocument(issue, {
   editorialRules: config.editorialRules,
   healthPolicy: config.healthPolicy,
 });
+/*
+ * 固定栏目的空话告警：不拦、不重试，只把「这条看着像同义反复」写进日志。
+ *
+ * 为什么不做硬校验：ai-tip / ai-know 是每天必选，硬校验失败会让整期日报停摆
+ * （2026-10-29、11-25 都停过）。而判据本身是启发式：在 150 条已发布卡片上会误杀
+ * 一两条好的辨析卡片。所以把它降级成告警 —— 日志里出现这行时，去控台用「换一条」
+ * 换掉这条候选，比让整期不出刊划算。
+ */
+for (const item of validatedIssue.items) {
+  if (item.type !== "ai-tip" && item.type !== "ai-know") continue;
+  if (summaryIsVacuous(`${item.title} ${item.summary}`)) {
+    console.warn(
+      `::warning title=固定栏目空话::${item.type}「${item.title}」的摘要没有一个可指认的对象或机制，` +
+        "读起来像同义反复；请在控台换一条候选，或改写这条摘要。",
+    );
+  }
+}
 await writeJsonAtomic(previewPath, { ...validatedIssue, stage });
 console.log(JSON.stringify({
   dryRun,

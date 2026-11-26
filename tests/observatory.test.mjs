@@ -19,9 +19,12 @@ import {
   collectEvergreenCatalog,
   countAcronyms,
   evergreenSearchFields,
+  evergreenSearchRejection,
+  hasConcreteAnchor,
   matchKeywordDirections,
   matchesBlockedKeywords,
   sourceDiversityReport,
+  summaryIsVacuous,
   takeWithSourceCap,
   toolRepositoryRejection,
 } from "../scripts/observatory/content-policy.mjs";
@@ -339,6 +342,33 @@ test("evergreen catalog keeps distinct keys even when entries share a source URL
   assert.equal(items.length, 4);
   assert.equal(new Set(items.map((item) => item.evergreenKey)).size, 4);
   assert.deepEqual(items.map((item) => item.typeHint), ["ai-tip", "ai-tip", "ai-know", "tool-pick"]);
+});
+
+test("固定栏目空话判据认出 11-25 的两条，且不误杀讲机制的卡片", () => {
+  // 2026-11-25 的两条实际输出：通篇关系陈述，没有一个可指认的对象或机制。
+  const knowledge = "议题只有打开和关闭，为什么还要“具体状态” 议题常被简化为打开和关闭两种状态，难以说明进展到哪一步。具体状态是在这两种状态之外补充进度信息，让团队和智能体对当前情况形成共同理解。";
+  const tip = "上手个人AI助手的第一个只读任务 个人智能体收到消息后，由运行时在后台执行任务，再把结果送回对话房间。入门时先做只读任务，风险最低；读取内容不等于把内容发出去。";
+  assert.equal(summaryIsVacuous(knowledge), true);
+  assert.equal(summaryIsVacuous(tip), true);
+
+  // 同样用「不等于」起头，但落到了具体机制上的好卡片不算空话 —— 判据看的是有没有说死。
+  assert.equal(
+    summaryIsVacuous("上下文窗口不等于模型的长期记忆：关掉对话后，模型不会自动记住上次的决定，除非你把摘要再次提供给它。"),
+    false,
+  );
+  assert.equal(hasConcreteAnchor("GitHub 议题新增 7 种状态"), true);
+  assert.equal(hasConcreteAnchor("AI 助手"), false);
+
+  /*
+   * 入池处只挡「正文太短、写不出卡片」，不判空话：
+   * 必选栏目缺供给会让整期日报停摆（2026-10-29、11-25 都停过），误杀的代价比多一条空话高。
+   */
+  assert.equal(evergreenSearchRejection({ title: "议题状态", excerpt: knowledge }, "ai-know"), null);
+  assert.match(
+    evergreenSearchRejection({ title: "AI 助手技巧", excerpt: "很短的一句话。" }, "ai-tip"),
+    /不够写出一张具体卡片/,
+  );
+  assert.equal(evergreenSearchRejection({ title: "只有标题", excerpt: "" }, "news"), null);
 });
 
 test("evergreen ranking skips unused keys that reuse a published source URL", async () => {
