@@ -128,7 +128,8 @@ export function weeklyEntriesToCandidates(entries, options = {}) {
   const trust = Number(options.trust ?? 0.9);
   const maximumPerSection = Math.max(0, Number(options.maximumItemsPerSection ?? 6));
   const discoveredAt = options.discoveredAt ?? new Date().toISOString();
-  const publishedAt = options.publishedAt ?? discoveredAt;
+  // 只传来源能证明的发布时间（该期文件的提交时间）；没有就不写，不拿采集时间顶替。
+  const publishedAt = options.publishedAt;
   const issueUrl = `https://github.com/${repo}/blob/${branch}/docs/issue-${issueNumber}.md`;
 
   const candidates = [];
@@ -149,6 +150,7 @@ export function weeklyEntriesToCandidates(entries, options = {}) {
       url: canonicalUrl(entry.url),
       excerpt: cleanText(entry.excerpt, 700),
       publishedAt,
+      publishedAtPrecision: publishedAt ? "minute" : undefined,
       discoveredAt,
       source: {
         id: "ruanyf-weekly",

@@ -133,7 +133,7 @@ function promptMessages(config, candidates, preferences, date, requiredTypes, co
         pinnedSummary ? `长期固定子主题：${pinnedSummary}。疾控条目最多 1 条，仅限全国、重庆、大连、北京、广州、上海、哈尔滨并优先全国监测；可合并相容的全国与城市候选。每条必须用 healthAdvice 分别写清近期要注意什么、哪些症状需要考虑何种感染、如何处理或何时就医；来源没给症状时明确写“官方来源未列出具体症状”，不得自行诊断。monitoring 可表述为监测到的流行水平；risk-alert 只能表述为近期应防范，不能写成已经暴发；monthly-report 只能作为月度背景。不得用一般疾控知识凑数。` : "",
         `内容允许 news/research/release/opportunity/analysis/ai-tip/ai-know/tool-pick。竞赛完全排除。${requiredTypes.length ? `本期必须且只能各选 1 条固定内容：${requiredTypes.join("、")}。每条固定内容必须单独成条，并且只引用下面点名的候选 id，不得与其他候选合并、不得当作其他条目的佐证、也不得改成其他类型——${requiredSlots}。` : ""}`,
         "岗位内容只用于观察市场，不代表准备申请。最多 1-2 条；opportunity.mode 必须是 observe，location、compensation、responsibilities、requirements 必须填写，来源没说明时写“来源未说明”，不得出现催促投递。",
-        "时效优先：今日发生或今日首次见报的新闻权重大幅高于一周内旧闻；优先选上海日历当日发布的条目，一周内旧闻只作补充。ai-tip、ai-know 和 tool-pick 是常青内容，不按新闻时效评价。ai-tip 写今天就能照做的操作习惯；ai-know 写名词本义、底层方法、易混辨析或能力边界，不要写成技巧；tool-pick 写今天为什么值得用某个工具。三类都要避免与历史重复。",
+        "时效优先：今日发生或今日首次见报的新闻权重大幅高于一周内旧闻；优先选上海日历当日发布的条目，一周内旧闻只作补充。ai-tip、ai-know 和 tool-pick 是常青内容，不按新闻时效评价。ai-tip 写今天就能照做的操作习惯；ai-know 写名词本义、底层方法、易混辨析或能力边界，不要写成技巧；tool-pick 写今天为什么值得用某个工具。三类都要避免与历史重复。候选没有 publishedAt 表示来源没有标注发布时间：不要写成「今日发布」，也不要把采集时间当成发布时间写进摘要。",
         /*
          * 固定栏目的空话问题：2026-11-25 的 ai-tip 是一份产品说明书的通用化改写（读完了不知道该
          * 用哪个产品做什么），ai-know 是 GitHub 更新日志的导语改写（「具体状态补充进度信息」，
@@ -338,11 +338,19 @@ function validateGenerated(data, candidates, config, requiredTypes, extraCandida
       };
     }
     const candidateGroupKey = [...candidateIds].sort().join("-");
+    /*
+     * 发布时间取被引用来源里最早的那条真实发布时间：同一件事可能有多家报道，谁先发出就算谁。
+     * 全都没标时间就留空，前端显示「时间未标注」——绝不拿采集时间顶替。
+     */
+    const knownPublished = supporting
+      .filter((candidate) => candidate.publishedAt && !Number.isNaN(Date.parse(candidate.publishedAt)))
+      .sort((left, right) => Date.parse(left.publishedAt) - Date.parse(right.publishedAt))[0];
     return [{
       id: `sig-${sha256(candidateGroupKey).slice(0, 14)}`,
       title: requiredText(raw.title, "title", 240),
       summary,
-      publishedAt: supporting[0].publishedAt,
+      publishedAt: knownPublished?.publishedAt,
+      publishedAtPrecision: knownPublished?.publishedAtPrecision,
       lane: raw.lane,
       topic: raw.topic,
       subtopic,

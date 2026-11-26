@@ -40,7 +40,7 @@ function collectEvergreenEntries(entries, type, discoveredAt) {
       title: cleanText(entry.title, 240),
       url: canonicalUrl(entry.url),
       excerpt: cleanText(entry.excerpt, 700),
-      publishedAt: discoveredAt,
+      // 常青目录里的条目没有「发布时刻」可言：不写 publishedAt，前端显示「常青」。
       discoveredAt,
       source: {
         id: `${type}-${entry.id}`,
@@ -280,4 +280,19 @@ export function toolRepositoryRejection(repository, settings) {
 
 export function isAllowedHealthRegion(region, allowedRegions) {
   return Array.isArray(allowedRegions) && allowedRegions.includes(region);
+}
+
+/*
+ * 疾控候选必须同时有证据等级（healthEvidence）和允许的地区，才算可用。
+ *
+ * 证据等级只由官方监测源写入；Brave 的疾控查询能捞回标题带城市的网页，地区是靠标题猜的、
+ * 证据等级为空，到 generate.mjs 的疾病条校验一定整条丢弃。而短名单里疾控候选只留一条
+ * （healthPolicy.maximumItemsPerIssue=1），模型每次都会选中这条必死的候选：少一条条目、
+ * 视野之外配额跟着少一条，焦点比例被顶到 0.75+0.08 的硬上限之上，三次尝试全部作废。
+ * 2026-11-25 晚间就是这条链子导致当天没出刊，所以在入池处就排除。
+ */
+export function isUsableHealthCandidate(candidate, healthPolicy) {
+  if (candidate?.subtopicHint !== "disease-control") return true;
+  return Boolean(candidate.healthEvidence)
+    && isAllowedHealthRegion(candidate.regionHint, healthPolicy?.allowedRegions);
 }

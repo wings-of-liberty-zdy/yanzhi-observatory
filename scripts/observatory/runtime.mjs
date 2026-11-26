@@ -220,7 +220,10 @@ export function clampIssuePublishedAt(issue, ceiling = issue?.updatedAt) {
     items: Array.isArray(issue.items)
       ? issue.items.map((item) => ({
           ...item,
-          publishedAt: clampTimestampToCeiling(item.publishedAt, ceiling),
+          // 没有真实发布时间时保持缺失，不能在这里补成采集时间
+          ...(item?.publishedAt
+            ? { publishedAt: clampTimestampToCeiling(item.publishedAt, ceiling) }
+            : {}),
           sources: Array.isArray(item.sources)
             ? item.sources.map((source) => (
                 source?.publishedAt

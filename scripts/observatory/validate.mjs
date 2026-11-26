@@ -119,8 +119,13 @@ export function validateNewsItem(value, source, updatedAt, options = {}) {
   }
   const reason = stringValue(value.reason, "reason", source, 800);
   const question = stringValue(value.question, "question", source, 800);
-  const publishedAt = timestampValue(value.publishedAt, "publishedAt", source);
-  if (Date.parse(publishedAt) > Date.parse(updatedAt)) fail(source, "publishedAt cannot be later than issue updatedAt.");
+  const publishedAt = value.publishedAt === undefined
+    ? undefined
+    : timestampValue(value.publishedAt, "publishedAt", source);
+  if (publishedAt && Date.parse(publishedAt) > Date.parse(updatedAt)) fail(source, "publishedAt cannot be later than issue updatedAt.");
+  const publishedAtPrecision = value.publishedAtPrecision === undefined
+    ? undefined
+    : enumValue(value.publishedAtPrecision, new Set(["date", "minute"]), "publishedAtPrecision", source);
   const sources = value.sources;
   if (!Array.isArray(sources) || sources.length < 1 || sources.length > 12) fail(source, "sources must contain 1-12 entries.");
   const normalizedSources = sources.map((entry, index) => validateSource(entry, source, index, updatedAt));
@@ -161,6 +166,7 @@ export function validateNewsItem(value, source, updatedAt, options = {}) {
     title: stringValue(value.title, "title", source, 240),
     summary,
     publishedAt,
+    publishedAtPrecision,
     lane: enumValue(value.lane, lanes, "lane", source),
     topic: enumValue(value.topic, topics, "topic", source),
     subtopic: value.subtopic === undefined ? undefined : stringValue(value.subtopic, "subtopic", source, 100, false),

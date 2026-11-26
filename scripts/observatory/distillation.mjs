@@ -267,7 +267,7 @@ function toCandidate(accepted, type, discoveredAt, date) {
     title,
     url: material.url,
     excerpt: summary,
-    publishedAt: discoveredAt,
+    // 蒸馏出来的技巧/知本没有对外发布时间，不写 publishedAt（前端显示「常青」）。
     discoveredAt,
     source: {
       id: `distilled-${type}`,

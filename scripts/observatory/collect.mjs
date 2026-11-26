@@ -6,6 +6,7 @@ import {
   evergreenSearchFields,
   evergreenSearchRejection,
   isAllowedHealthRegion,
+  isUsableHealthCandidate,
   matchesBlockedKeywords,
   toolRepositoryRejection,
 } from "./content-policy.mjs";
@@ -40,6 +41,7 @@ import {
   readRecentDigest,
 } from "./distillation.mjs";
 import { classifySearchFailure } from "./search-health.mjs";
+import { sourcePublishedAt } from "./publish-time.mjs";
 
 const dryRun = process.argv.includes("--dry-run");
 const noPaidSearch = process.argv.includes("--no-paid-search");
@@ -109,7 +111,6 @@ function normalizeFeedEntry(entry, feed, discoveredAt) {
   );
   const rawPublished =
     text(entry.pubDate) || text(entry.published) || text(entry.updated) || text(entry["dc:date"]);
-  const publishedAt = Number.isNaN(Date.parse(rawPublished)) ? discoveredAt : new Date(rawPublished).toISOString();
   const opportunitySignal = /\b(full[- ]?time|part[- ]?time|internship|hiring|job\s+opening|vacanc(?:y|ies)|openings?)\b|\b(?:research|engineering|software|hardware|robotics)\s+position\b|招聘|实习|岗位|职位/i.test(
     `${title} ${excerpt}`,
   );
@@ -118,7 +119,7 @@ function normalizeFeedEntry(entry, feed, discoveredAt) {
     title,
     url,
     excerpt,
-    publishedAt,
+    ...sourcePublishedAt(rawPublished),
     discoveredAt,
     source: {
       id: feed.id,
@@ -296,6 +297,7 @@ async function collectHealthSource(source, config, preferences, discoveredAt) {
         url: canonicalUrl(entry.articleUrl),
         excerpt: cleanText(`地区：${source.region}。证据：${source.evidence}。${excerpt}`, 1600),
         publishedAt,
+        publishedAtPrecision: "date",
         discoveredAt,
         source: {
           id: source.id,
@@ -378,7 +380,8 @@ async function collectWeeklyItems(config, discoveredAt) {
     ]);
     const markdown = await readResponseText(content, 2_000_000);
     if (!content.ok) throw new Error(`GitHub ${content.status}（${filePath}）`);
-    let publishedAt = discoveredAt;
+    // 周刊的「发布时间」＝该期文件最后一次提交的时间；拿不到就留空，不拿采集时间顶替。
+    let publishedAt;
     if (commit?.ok) {
       const commits = JSON.parse(await readResponseText(commit, 1_000_000));
       const stamp = array(commits)[0]?.commit?.committer?.date ?? array(commits)[0]?.commit?.author?.date;
@@ -436,6 +439,7 @@ async function collectKeywordDiscovery(config, discoveredAt) {
       url: canonicalUrl(entry.url),
       excerpt: cleanText(entry.excerpt, 700),
       publishedAt: entry.publishedAt,
+      publishedAtPrecision: entry.publishedAt ? entry.publishedAtPrecision : undefined,
       discoveredAt,
       source: { id: engineId, name: engineName, url: engineUrl, language: "en", trust: 0.8 },
       topicHint: direction.topic,
@@ -476,7 +480,7 @@ async function collectKeywordDiscovery(config, discoveredAt) {
             title: hit.title,
             url: hit.url,
             excerpt: `Hacker News 近期讨论（${Number(hit.points ?? 0)} 分，${Number(hit.num_comments ?? 0)} 条评论）。`,
-            publishedAt: hit.created_at ?? discoveredAt,
+            ...sourcePublishedAt(hit.created_at),
           }, direction.type ?? "news");
         }
       })());
@@ -507,7 +511,7 @@ async function collectKeywordDiscovery(config, discoveredAt) {
               title: text(entry.title).replace(/\s+/g, " ").trim(),
               url: link,
               excerpt: text(entry.summary).replace(/\s+/g, " ").trim(),
-              publishedAt: text(entry.published) || text(entry.updated) || discoveredAt,
+              ...sourcePublishedAt(text(entry.published) || text(entry.updated)),
             }, "research");
           }
         } catch (error) {
@@ -578,7 +582,7 @@ async function collectToolDiscovery(config, discoveredAt) {
         `${repository.description ?? "未提供说明"}。GitHub stars: ${repository.stargazers_count ?? 0}。主要语言：${repository.language ?? "未标注"}。`,
         700,
       ),
-      publishedAt: repository.updated_at ?? discoveredAt,
+      ...sourcePublishedAt(repository.updated_at),
       discoveredAt,
       source: {
         id: "github-tool-discovery",
@@ -672,7 +676,6 @@ async function braveSearch(queryConfig, config, searchProvider, discoveredAt) {
           title,
           url: resultUrl,
           excerpt: cleanText(result.description),
-          publishedAt: discoveredAt,
           discoveredAt,
           source: {
             id: `web-${hostname}`,
@@ -810,7 +813,8 @@ async function deepseekSearch(queryConfig, config, searchProvider, discoveredAt)
           title,
           url: resultUrl,
           excerpt,
-          publishedAt: typeof result.date === "string" ? result.date : discoveredAt,
+          // 付费搜索偶尔会带 date；没有就留空，采集时间不进 publishedAt。
+          ...sourcePublishedAt(result.date),
           discoveredAt,
           source: {
             id: `web-${hostname}`,
@@ -1102,7 +1106,7 @@ if (config.skillDistillation?.enabled && (!dryRun || distillInDryRun)) {
   }
 }
 
-const pool = deduplicate([
+const rawPool = deduplicate([
   ...existing.items,
   // 蒸馏候选是 evergreen（按 key 去重），与源素材的 url 去重互不干扰，
   // 放在这里只是与其它固定内容相邻，便于阅读。
@@ -1114,13 +1118,17 @@ const pool = deduplicate([
   ...freshWeeklyItems,
   ...freshKeywordItems,
   ...freshSearchItems,
-])
+]);
+const pool = rawPool
   .filter((candidate) => !isCompetitionCandidate(candidate))
-  .filter((candidate) => candidate.subtopicHint !== "disease-control" || isAllowedHealthRegion(
-    candidate.regionHint,
-    config.healthPolicy?.allowedRegions,
-  ))
+  .filter((candidate) => isUsableHealthCandidate(candidate, config.healthPolicy))
   .filter((candidate) => preferences.sourceTrust?.[candidate.source.id] !== "blocked");
+const unusableHealthCount = rawPool.length - rawPool.filter(
+  (candidate) => isUsableHealthCandidate(candidate, config.healthPolicy),
+).length;
+if (unusableHealthCount > 0) {
+  console.log(`[health] skipped ${unusableHealthCount} disease-control candidate(s) without an evidence class or an allowed region.`);
+}
 
 /*
  * 同题反查（corroboration）不在这里做。
@@ -1134,10 +1142,8 @@ const pool = deduplicate([
 
 const items = deduplicate(pool)
   .filter((candidate) => !isCompetitionCandidate(candidate))
-  .filter((candidate) => candidate.subtopicHint !== "disease-control" || isAllowedHealthRegion(
-    candidate.regionHint,
-    config.healthPolicy?.allowedRegions,
-  ))
+  // pool 已经过同一道疾控筛选，这里保留是为了断言「落盘池子里不存在必死的疾控候选」。
+  .filter((candidate) => isUsableHealthCandidate(candidate, config.healthPolicy))
   .filter((candidate) => preferences.sourceTrust?.[candidate.source.id] !== "blocked")
   .slice(0, config.collection.maxCandidatesPerDay);
 

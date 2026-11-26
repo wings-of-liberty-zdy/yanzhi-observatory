@@ -1,5 +1,6 @@
 import { XMLParser } from "fast-xml-parser";
 import { matchesBlockedKeywords } from "./content-policy.mjs";
+import { sourcePublishedAt } from "./publish-time.mjs";
 import {
   candidateId,
   canonicalUrl,
@@ -158,7 +159,8 @@ export function toCorroborationCandidate(seed, entry, channel, discoveredAt, con
       entry.excerpt || `同题反查（${channel.label}）命中：${seed.title}`,
       700,
     ),
-    publishedAt: entry.publishedAt ?? discoveredAt,
+    publishedAt: entry.publishedAt,
+    publishedAtPrecision: entry.publishedAt ? entry.publishedAtPrecision : undefined,
     discoveredAt,
     source: {
       id: `web-${host}`,
@@ -272,7 +274,7 @@ export function parseGoogleNewsFeed(xml) {
         title,
         url: publisherLink ?? "",
         excerpt: cleanText(markup, 200),
-        publishedAt: Number.isNaN(Date.parse(rawPublished)) ? undefined : new Date(rawPublished).toISOString(),
+        ...sourcePublishedAt(rawPublished),
         sourceName: cleanText(textOf(item.source), 120),
       };
     })
@@ -318,7 +320,7 @@ async function searchHackerNews(seed, config, options) {
       title: hit.title,
       url: hit.url,
       excerpt: `Hacker News 讨论（${Number(hit.points ?? 0)} 分）：${hit.title}`,
-      publishedAt: hit.created_at,
+      ...sourcePublishedAt(hit.created_at),
     }));
 }
 
@@ -435,8 +437,8 @@ async function searchWebProvider(seed, config, searchProvider, options) {
         url: result.url,
         excerpt: cleanText(result.description, 400),
         sourceName: cleanText(result.profile?.long_name || hostOf(result.url), 180),
-        // Brave 的 page_age 是 ISO 时间；没有就交给上游按发现时间处理。
-        publishedAt: typeof result.page_age === "string" ? result.page_age : undefined,
+        // Brave 的 page_age 是 ISO 时间；解析不出来就当来源没标注，不补采集时间。
+        ...sourcePublishedAt(result.page_age),
       }));
   } catch (error) {
     await settleBudget(config, reservation, {
@@ -504,7 +506,7 @@ async function searchDeepSeek(seed, config, searchProvider, options) {
         url: result.url,
         excerpt: cleanText(result.summary || result.snippet || result.content, 700),
         sourceName: cleanText(result.site_name || hostOf(result.url), 180),
-        publishedAt: typeof result.date === "string" ? result.date : undefined,
+        ...sourcePublishedAt(result.date),
         language,
       }));
     await settleBudget(config, reservation, {

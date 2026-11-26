@@ -23,6 +23,7 @@ import {
   hasConcreteAnchor,
   matchKeywordDirections,
   matchesBlockedKeywords,
+  isUsableHealthCandidate,
   sourceDiversityReport,
   summaryIsVacuous,
   takeWithSourceCap,
@@ -58,7 +59,7 @@ import { RECENCY, recencyScore, scoreBreakdown, scoreCandidate } from "../script
 // 时效标签的判级语义由言志前端的 `lib/timeliness.ts` 定义：观测站写进日报的 level 必须与前端
 // 渲染出来的标签是同一套。这里按 projectRoot 载入那份唯一真源，不在本仓库复制第二份
 // （2026-10-08 的候选池判废事故正是副本分叉造成的）。该模块只有 type-only import，可被 node 直接载入。
-const { getNewsTimeliness } = await import(
+const { describeTimelinessChip, getNewsTimeliness } = await import(
   pathToFileURL(path.join(projectRoot, "lib", "timeliness.ts")).href
 );
 
@@ -81,6 +82,23 @@ test("labels timeliness against the issue date instead of the current date", () 
   assert.equal(getNewsTimeliness("2026-08-25T00:00:00.000Z", "2026-08-31").level, "week");
   assert.equal(getNewsTimeliness("2026-08-01T00:00:00.000Z", "2026-08-31").level, "background");
   assert.equal(getNewsTimeliness("2026-09-01T00:00:00.000Z", "2026-08-31").level, "future");
+});
+
+test("没有真实发布时间的条目不会被塞进采集时间", () => {
+  const unknown = getNewsTimeliness(undefined, "2026-10-24");
+  assert.equal(unknown.level, "unknown");
+  assert.equal(describeTimelinessChip(unknown).text, "时间未标注");
+  // 常青内容与时间无关：有没有时间戳都只写「常青」
+  assert.equal(getNewsTimeliness(undefined, "2026-10-24", true).level, "evergreen");
+  assert.equal(describeTimelinessChip(getNewsTimeliness(undefined, "2026-10-24", true)).text, "常青");
+  // 只有日期时不补 00:00 的假精度
+  const dated = describeTimelinessChip(
+    getNewsTimeliness("2026-10-23T00:11:49.000Z", "2026-10-24"),
+    { label: "10/23", precision: "date" },
+  );
+  assert.equal(dated.kind, "time");
+  assert.equal(dated.text, "10/23");
+  assert.match(dated.title, /^发布日期 10\/23/);
 });
 
 test("today's news outrank week-old news by a wide margin", () => {
@@ -322,6 +340,26 @@ test("strict issue validation rejects impossible dates and duplicate sources", a
   const duplicateSource = structuredClone(issue);
   duplicateSource.items[0].sources[1].url = duplicateSource.items[0].sources[0].url;
   assert.throws(() => validateIssueDocument(duplicateSource, { source: "duplicate-source", storage: "public" }));
+});
+
+test("缺少发布时间或只给日期都能通过校验", async () => {
+  const issue = JSON.parse(
+    await fs.readFile(path.join(observatoryPaths.publicIssues, "2026-08-30.json"), "utf8"),
+  );
+  const undated = structuredClone(issue);
+  delete undated.items[0].publishedAt;
+  undated.items[0].sources.forEach((source) => delete source.publishedAt);
+  const validated = validateIssueDocument(undated, { source: "undated", storage: "public", minimumItems: 6 });
+  assert.equal(validated.items[0].publishedAt, undefined);
+
+  const dateOnly = structuredClone(issue);
+  dateOnly.items[0].publishedAtPrecision = "date";
+  const dated = validateIssueDocument(dateOnly, { source: "date-only", storage: "public", minimumItems: 6 });
+  assert.equal(dated.items[0].publishedAtPrecision, "date");
+
+  const bogus = structuredClone(issue);
+  bogus.items[0].publishedAtPrecision = "hour";
+  assert.throws(() => validateIssueDocument(bogus, { source: "bad-precision", storage: "public", minimumItems: 6 }));
 });
 
 test("evergreen catalog keeps distinct keys even when entries share a source URL", () => {
@@ -1257,6 +1295,27 @@ test("中文种子在 Hacker News 上计为「跳过」而不是「查询过」"
   assert.equal(stats.channels.hackernews.queries, 0);
   assert.equal(stats.channels.hackernews.skipped, 1);
   assert.equal(stats.channels.hackernews.results, 0);
+});
+
+test("疾控候选缺证据等级或地区不在名单内时不入池", () => {
+  const healthPolicy = { allowedRegions: ["全国", "重庆", "大连", "北京", "广州", "上海", "哈尔滨"] };
+  // 官方监测源写入的候选：地区在名单内且有证据等级，可用。
+  assert.equal(isUsableHealthCandidate(
+    { subtopicHint: "disease-control", regionHint: "全国", healthEvidence: "monitoring" },
+    healthPolicy,
+  ), true);
+  // Brave 疾控查询捞回的网页：地区从标题猜出来，但 healthEvidence 为空，
+  // 到 generate 的疾病条校验必被整条丢弃，留在池子里只会每期损失一个条目。
+  assert.equal(isUsableHealthCandidate(
+    { subtopicHint: "disease-control", regionHint: "重庆", healthEvidence: undefined },
+    healthPolicy,
+  ), false);
+  assert.equal(isUsableHealthCandidate(
+    { subtopicHint: "disease-control", regionHint: "成都", healthEvidence: "monitoring" },
+    healthPolicy,
+  ), false);
+  // 非疾控候选不受这条规则影响。
+  assert.equal(isUsableHealthCandidate({ subtopicHint: "ai-tip", healthEvidence: undefined }, healthPolicy), true);
 });
 
 test("搜索失败分三类：额度、限流、其它", () => {

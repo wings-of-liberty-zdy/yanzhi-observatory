@@ -28,3 +28,13 @@ test("generated issues keep source clocks from beating updatedAt", () => {
   assert.equal(issue.items[0].sources[0].publishedAt, "2026-09-12T14:18:18.000Z");
   assert.equal(issue.items[0].sources[1].publishedAt, ceiling);
 });
+
+test("缺失的发布时间不会被天花板补成采集时间", () => {
+  const ceiling = "2026-09-12T14:18:47.000Z";
+  const issue = clampIssuePublishedAt({
+    updatedAt: ceiling,
+    items: [{ id: "sig-undated", sources: [{ id: "web", url: "https://example.com/a" }] }],
+  }, ceiling);
+  assert.equal(issue.items[0].publishedAt, undefined);
+  assert.equal("publishedAt" in issue.items[0], false);
+});
